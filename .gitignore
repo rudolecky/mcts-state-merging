@@ -1,0 +1,14 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Experiment outputs (raw hidden-state pickles are large; regenerate via collect.py)
+results/
+.pytest_cache/
