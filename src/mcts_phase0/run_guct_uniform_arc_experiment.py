@@ -47,6 +47,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--budgets", type=int, nargs="+", default=[500, 2000, 5000])
     ap.add_argument("--repeats", type=int, default=10)
+    ap.add_argument("--moves-per-node", type=int, default=25)
     ap.add_argument("--output-dir", default="results/guct_uniform_arc_experiment")
     args = ap.parse_args()
 
@@ -72,11 +73,11 @@ def main():
             tree_nodes = merge_nodes = 0
             for r in range(args.repeats):
                 rng1 = random.Random(i * 100_003 + r)
-                g = m.run_search(task.train_inputs, task.train_outputs, m.GUCTUniformConfig(merge_enabled=False), budget, rng1)
+                g = m.run_search(task.train_inputs, task.train_outputs, m.GUCTUniformConfig(merge_enabled=False, moves_per_node=args.moves_per_node), budget, rng1)
                 tree_solved += int(m.is_solved(g))
                 tree_nodes += len(g.nodes)
                 rng2 = random.Random(i * 100_003 + r)
-                g2 = m.run_search(task.train_inputs, task.train_outputs, m.GUCTUniformConfig(merge_enabled=True), budget, rng2)
+                g2 = m.run_search(task.train_inputs, task.train_outputs, m.GUCTUniformConfig(merge_enabled=True, moves_per_node=args.moves_per_node), budget, rng2)
                 merge_solved += int(m.is_solved(g2))
                 merge_nodes += len(g2.nodes)
             rows.append({"task_id": task.task_id, "tree": tree_solved / args.repeats, "merge": merge_solved / args.repeats,
