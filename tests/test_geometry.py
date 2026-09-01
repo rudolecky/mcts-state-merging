@@ -188,6 +188,7 @@ def test_snapshot_record_old_style_construction_still_works():
         v_hat=0.5, hidden={"layer0": np.zeros(4)},
     )
     assert r.ground_truth_key is None
+    assert r.step_bodies is None
 
 
 def test_ground_truth_merge_confusion_matches_hand_built_matrix_and_skips_none_keys():
@@ -216,6 +217,38 @@ def test_ground_truth_merge_confusion_matches_hand_built_matrix_and_skips_none_k
     assert result["correct_non_merge"] == 2  # (0,3),(1,3): different key, projection distinguishes
     assert result["precision"] == 1 / 3
     assert result["recall"] == 1 / 2
+
+
+def test_ground_truth_merge_confusion_return_pairs_gives_exact_indices():
+    # Same fixture as the matrix test above -- return_pairs=True must yield
+    # the exact same categorization, just with (i, j) identities attached
+    # instead of only counts, so a caller can go back to `records` and
+    # inspect e.g. step_bodies for a false-merge trajectory audit.
+    records = [
+        SnapshotRecord(dataset="d", problem_id="p1", trace_idx=0, step_idx=1, v_hat=0.5,
+                       hidden={}, ground_truth_key="A"),
+        SnapshotRecord(dataset="d", problem_id="p1", trace_idx=1, step_idx=1, v_hat=0.5,
+                       hidden={}, ground_truth_key="A"),
+        SnapshotRecord(dataset="d", problem_id="p1", trace_idx=2, step_idx=1, v_hat=0.5,
+                       hidden={}, ground_truth_key="B"),
+        SnapshotRecord(dataset="d", problem_id="p1", trace_idx=3, step_idx=1, v_hat=0.5,
+                       hidden={}, ground_truth_key="B"),
+        SnapshotRecord(dataset="d", problem_id="p1", trace_idx=4, step_idx=1, v_hat=0.5,
+                       hidden={}, ground_truth_key=None),
+    ]
+    projected = np.array([0.10, 0.10, 0.10, 0.90, 0.10])
+
+    result = ground_truth_merge_confusion(records, projected, tau=0.05, step_tolerance=0, return_pairs=True)
+
+    assert result["true_merge_pairs"] == [(0, 1)]
+    assert result["false_merge_pairs"] == [(0, 2), (1, 2)]
+    assert result["missed_merge_pairs"] == [(2, 3)]
+    assert result["correct_non_merge_pairs"] == [(0, 3), (1, 3)]
+    # counts stay identical to the non-pairs call -- purely additive
+    assert result["true_merge"] == 1
+    assert result["false_merge"] == 2
+    assert result["missed_merge"] == 1
+    assert result["correct_non_merge"] == 2
 
 
 def test_gate_passes_filters_correctly():

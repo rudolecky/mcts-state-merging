@@ -272,3 +272,44 @@ def parse_and_verify(
 
     is_correct = (claimed == instance.answer) and (instance.answer == "no" or well_formed)
     return is_correct, {"well_formed": well_formed, "reason": "ok" if is_correct else "answer/chain mismatch"}
+
+
+def canonical_state_at(instance: ProsQAInstance, step_bodies_so_far: list[str]) -> str | None:
+    """Ground-truth "same state" key for a snapshot taken after some prefix
+    of steps within one trace -- passed to collect.py as a
+    `ground_truth_key_fn`, mirroring connect_four.canonical_state_at.
+
+    The key is the *current entity reached* (chain[-1][1], or instance.start
+    if no steps yet), not the full fact-sequence asserted so far. Facts are
+    never consumed (fact_set below is membership-only), so two prefixes that
+    reach the same entity are provably interchangeable for everything that
+    happens next -- this is ProsQA's actual Markov state, the same sense in
+    which the classical domains' board/puzzle state is. Keying on the full
+    sequence instead would call every different-order-same-destination
+    derivation "different," which isn't the question this exists to answer:
+    the generator's own reconverge_fraction (_build_component) deliberately
+    builds a second, genuinely different fact-sequence reaching the same
+    downstream entity as the main chain, and that pair is exactly the real
+    transposition this key is meant to recognize as one state.
+
+    Fails closed like connect_four's version: any unparseable step, any
+    fact not in fact_set, or any non-contiguous jump (this step's subject
+    isn't the entity the previous steps arrived at) returns None rather than
+    a misleading key, so a malformed/partial prefix skips cleanly out of
+    geometry.ground_truth_merge_confusion instead of poisoning it.
+    """
+    import re as _re
+
+    fact_set = set(instance.facts)
+    line_re = _re.compile(r"^\s*(.+?)\s+is a\s+(.+?)\s*\.?\s*$")
+
+    current = instance.start
+    for body in step_bodies_so_far:
+        m = line_re.match(body)
+        if not m:
+            return None
+        x, y = m.group(1).strip().rstrip("."), m.group(2).strip().rstrip(".")
+        if (x, y) not in fact_set or x != current:
+            return None
+        current = y
+    return current

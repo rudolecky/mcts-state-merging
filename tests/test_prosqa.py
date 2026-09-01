@@ -1,6 +1,8 @@
 from mcts_phase0.datasets.prosqa import (
+    ProsQAInstance,
     _path_count,
     average_path_count,
+    canonical_state_at,
     generate_dataset,
     parse_and_verify,
 )
@@ -130,3 +132,61 @@ def test_parse_and_verify_rejects_missing_answer():
     ok, info = parse_and_verify(inst, [], None)
     assert not ok
     assert info["reason"] == "no answer line"
+
+
+# ---------- canonical_state_at: ground-truth "same state" key ----------
+
+def _reconverging_instance() -> ProsQAInstance:
+    # Same shortcut-reconvergence fixture as test_path_count_with_shortcut_reconvergence:
+    # a->b->c->d is the main chain, a->c is a genuinely different second route to c.
+    facts = (("a", "b"), ("b", "c"), ("c", "d"), ("a", "c"))
+    return ProsQAInstance(
+        facts=facts, start="a", target="d", answer="yes",
+        path_count=2, correct_path=("a", "b", "c", "d"),
+    )
+
+
+def test_canonical_state_at_empty_prefix_is_start():
+    inst = _reconverging_instance()
+    assert canonical_state_at(inst, []) == "a"
+
+
+def test_canonical_state_at_follows_a_valid_prefix():
+    inst = _reconverging_instance()
+    assert canonical_state_at(inst, ["a is a b"]) == "b"
+    assert canonical_state_at(inst, ["a is a b", "b is a c"]) == "c"
+    assert canonical_state_at(inst, ["a is a b", "b is a c", "c is a d"]) == "d"
+
+
+def test_canonical_state_at_recognizes_the_real_transposition():
+    # The main chain (2 hops) and the reconverging shortcut (1 hop) are a
+    # genuine, by-construction transposition: two different fact-sequences
+    # reaching the identical current entity. This property is the whole
+    # reason canonical_state_at keys on current entity, not full sequence.
+    inst = _reconverging_instance()
+    via_chain = canonical_state_at(inst, ["a is a b", "b is a c"])
+    via_shortcut = canonical_state_at(inst, ["a is a c"])
+    assert via_chain == via_shortcut == "c"
+
+
+def test_canonical_state_at_none_on_fact_not_given():
+    inst = _reconverging_instance()
+    assert canonical_state_at(inst, ["a is a zzz"]) is None
+
+
+def test_canonical_state_at_none_on_unparseable_step():
+    inst = _reconverging_instance()
+    assert canonical_state_at(inst, ["not a valid line at all"]) is None
+
+
+def test_canonical_state_at_none_on_non_contiguous_jump():
+    # "b is a c" is a real fact, but the prefix never established "b" as the
+    # current entity (current starts at "a") -- a disconnected step, not a
+    # continuation, so this must fail closed rather than silently landing on "c".
+    inst = _reconverging_instance()
+    assert canonical_state_at(inst, ["b is a c"]) is None
+
+
+def test_canonical_state_at_none_after_an_already_bad_step():
+    inst = _reconverging_instance()
+    assert canonical_state_at(inst, ["a is a zzz", "a is a b"]) is None

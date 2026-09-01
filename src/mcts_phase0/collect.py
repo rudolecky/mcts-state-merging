@@ -108,6 +108,7 @@ def collect_for_dataset(
                     num_rollouts, max_new_tokens_rollout, temperature, split_fn=split_fn,
                 )
                 ground_truth_key = None
+                step_bodies_so_far = None
                 if ground_truth_key_fn is not None:
                     prefix_text = lm.tokenizer.decode(
                         full_ids[prompt_ids.shape[0] : token_idx + 1].tolist(), skip_special_tokens=True
@@ -124,6 +125,7 @@ def collect_for_dataset(
                         hidden=hidden_vecs,
                         boundary_kind=boundary_kind,
                         ground_truth_key=ground_truth_key,
+                        step_bodies=tuple(step_bodies_so_far) if step_bodies_so_far is not None else None,
                     )
                 )
     return records
@@ -233,6 +235,7 @@ def main():
         lm, "prosqa", pq_instances, prosqa.build_prompt, prosqa.parse_and_verify,
         layers, args.num_traces, args.max_snapshots_per_trace, args.num_rollouts,
         args.max_new_tokens_trace, args.max_new_tokens_rollout, args.temperature,
+        ground_truth_key_fn=prosqa.canonical_state_at,
     )
     if cf_instances:
         all_records += collect_for_dataset(

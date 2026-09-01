@@ -41,9 +41,12 @@ class SnapshotRecord:
     hidden: dict[str, np.ndarray]  # layer_name -> 1D vector
     boundary_kind: str = "step"  # "step" (Step N: lines) or "position" (fallback; see model.py)
     ground_truth_key: object | None = None  # exact "same state" label, dataset-populated only
-    # where one exists (e.g. connect_four's canonical board+side-to-move); None for datasets
-    # with no ground-truth state identity (countdown, prosqa), which is also what makes
-    # ground_truth_merge_confusion() below a natural no-op for them.
+    # where one exists (e.g. connect_four's canonical board+side-to-move, prosqa's current
+    # entity reached); None for datasets with no ground-truth state identity (countdown),
+    # which is also what makes ground_truth_merge_confusion() below a natural no-op for them.
+    step_bodies: tuple[str, ...] | None = None  # the actual step-line text reaching this
+    # snapshot, populated alongside ground_truth_key -- lets a false-merge audit show the two
+    # conflicting trajectories directly instead of needing to regenerate anything.
 
 
 def filter_consistent_boundary_kind(records: list[SnapshotRecord]) -> list[SnapshotRecord]:
@@ -244,22 +247,30 @@ def ground_truth_merge_confusion(
     tau: float,
     same_step_only: bool = True,
     step_tolerance: int = 1,
+    return_pairs: bool = False,
 ) -> dict:
     """Cross ground-truth exact-state-equality against the projection's
     tau-threshold merge decision, at the actual deployed tau -- a strictly
     sharper validation than the value-outcome-based false-merge-rate proxy
-    used everywhere else in this project, for the one dataset (so far:
-    connect_four) that can supply a real "same state" label independent of
-    the projection.
+    used everywhere else in this project, for a dataset that can supply a
+    real "same state" label independent of the projection (so far:
+    connect_four, prosqa).
 
     Pairs where either record's ground_truth_key is None are skipped, which
-    makes this a natural no-op for countdown/prosqa -- dataset-agnostic at
-    the logic level even though the field is dataset-populated.
+    makes this a natural no-op for countdown -- dataset-agnostic at the
+    logic level even though the field is dataset-populated.
 
     Returns counts for the four confusion-matrix cells plus precision/recall
     of the merge decision against ground truth (precision = of the pairs the
     projection would merge, how many are real transpositions; recall = of
     the real transpositions, how many the projection would actually merge).
+
+    If return_pairs is True, also returns the four categorized (i, j) index
+    lists (true_merge_pairs, false_merge_pairs, missed_merge_pairs,
+    correct_non_merge_pairs), letting a caller go back to `records` and
+    inspect exactly which snapshots a false merge involved -- e.g. their
+    step_bodies, for a false-merge trajectory audit. Omitted by default to
+    keep the return shape identical to every existing caller.
     """
     pairs = build_pairs(records, same_step_only=same_step_only, step_tolerance=step_tolerance)
     pairs = [
@@ -267,32 +278,46 @@ def ground_truth_merge_confusion(
         if records[i].ground_truth_key is not None and records[j].ground_truth_key is not None
     ]
     if not pairs:
-        return {"n_pairs": 0, "tau": tau}
+        result = {"n_pairs": 0, "tau": tau}
+        if return_pairs:
+            result.update(true_merge_pairs=[], false_merge_pairs=[], missed_merge_pairs=[], correct_non_merge_pairs=[])
+        return result
 
     true_merge = false_merge = missed_merge = correct_non_merge = 0
+    true_merge_pairs, false_merge_pairs, missed_merge_pairs, correct_non_merge_pairs = [], [], [], []
     for i, j in pairs:
         same_state = records[i].ground_truth_key == records[j].ground_truth_key
         would_merge = abs(projected[i] - projected[j]) < tau
         if same_state and would_merge:
             true_merge += 1
+            true_merge_pairs.append((i, j))
         elif not same_state and would_merge:
             false_merge += 1
+            false_merge_pairs.append((i, j))
         elif same_state and not would_merge:
             missed_merge += 1
+            missed_merge_pairs.append((i, j))
         else:
             correct_non_merge += 1
+            correct_non_merge_pairs.append((i, j))
 
     n_would_merge = true_merge + false_merge
     n_same_state = true_merge + missed_merge
     precision = true_merge / n_would_merge if n_would_merge > 0 else float("nan")
     recall = true_merge / n_same_state if n_same_state > 0 else float("nan")
 
-    return {
+    result = {
         "n_pairs": len(pairs), "tau": tau,
         "true_merge": true_merge, "false_merge": false_merge,
         "missed_merge": missed_merge, "correct_non_merge": correct_non_merge,
         "precision": precision, "recall": recall,
     }
+    if return_pairs:
+        result.update(
+            true_merge_pairs=true_merge_pairs, false_merge_pairs=false_merge_pairs,
+            missed_merge_pairs=missed_merge_pairs, correct_non_merge_pairs=correct_non_merge_pairs,
+        )
+    return result
 
 
 def required_n_for_power(target_rho: float, power: float = 0.8, alpha: float = 0.05) -> int:
