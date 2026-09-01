@@ -128,3 +128,15 @@ def test_merge_mode_never_creates_more_nodes_than_tree_mode_for_the_same_budget(
     rng = random.Random(0)
     merge_graph = m.run_search(task.train_inputs, task.train_outputs, m.GUCTUniformConfig(merge_enabled=True), budget=150, rng=rng)
     assert len(merge_graph.nodes) <= len(tree_graph.nodes)
+
+
+def test_run_search_stats_counts_new_nodes_and_merge_hits():
+    task = _load_real_task("68b16354")
+    rng = random.Random(0)
+    config = m.GUCTUniformConfig(merge_enabled=True)
+    stats = {}
+    m.run_search(task.train_inputs, task.train_outputs, config, budget=150, rng=rng, stats=stats)
+    total = stats.get("new_nodes", 0) + stats.get("merge_hits", 0)
+    assert total <= 150  # <= since real-execution failures can end the search before using full budget
+    assert total > 0
+    assert stats.get("new_nodes", 0) > 0

@@ -207,3 +207,21 @@ def test_run_random_search_solves_a_small_puzzle_most_of_the_time():
         if run_random_search(start, goal, task, budget=50, rollout_depth=15, rng=rng):
             solved_count += 1
     assert solved_count >= trials * 0.9
+
+
+def test_run_search_stats_counts_new_nodes_and_merge_hits():
+    task = make_task(3)
+    goal = goal_state(3)
+    heuristic = hFFHeuristic(task)
+    start = frozenset({
+        "ontable(1)", "ontable(2)", "ontable(3)",
+        "clear(1)", "clear(2)", "clear(3)", "handempty",
+    })
+    rng = random.Random(0)
+    config = GUCTUniformConfig(merge_enabled=True)
+    stats = {}
+    run_search(start, goal, task, config, budget=50, rng=rng, heuristic=heuristic, stats=stats)
+    total = stats.get("new_nodes", 0) + stats.get("merge_hits", 0)
+    assert total <= 50  # <= since a small puzzle's whole reachable graph can exhaust before budget
+    assert total > 0
+    assert stats.get("new_nodes", 0) > 0

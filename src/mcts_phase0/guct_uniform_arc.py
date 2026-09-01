@@ -190,6 +190,7 @@ def backup(graph: MCTSGraph, path: list, path_moves: list, value: float) -> None
 
 def run_search(
     train_inputs: tuple, target_outputs: tuple, config: GUCTUniformConfig, budget: int, rng: random.Random,
+    stats: dict | None = None,
 ) -> MCTSGraph:
     """budget counts EXPANSIONS. No rollout_depth -- evaluation is one
     heuristic call, never a rollout. Same closed-edge divergence-prevention
@@ -198,7 +199,13 @@ def run_search(
     leaf.untried_moves was non-empty at entry (every remaining move failed
     at real execution) -- treated identically to "no untried moves left",
     since by the time expand() returns None the leaf's untried_moves list
-    has already been fully consumed internally."""
+    has already been fully consumed internally.
+
+    stats, if provided, gets "new_nodes"/"merge_hits" counters incremented
+    -- see RUBIKS_CUBE_FINDINGS.md's mechanism section, ported here (and to
+    guct_uniform_blocksworld.py) to compare budget accounting directly
+    across the domain that shows a persistent gap (Blocksworld) and one
+    that shows parity (this one)."""
     graph = create_root(train_inputs, target_outputs, config, rng)
     expansions_used = 0
     iterations = 0
@@ -218,6 +225,7 @@ def run_search(
             parent = graph.nodes[path[-2]]
             parent.children[path_moves[-1]].closed = True
             continue
+        nodes_before = len(graph.nodes)
         expanded = expand(graph, path[-1], target_outputs, config, rng)
         if expanded is None:
             if len(path) == 1:
@@ -227,6 +235,11 @@ def run_search(
             continue
         child_key, move = expanded
         expansions_used += 1
+        if stats is not None:
+            if len(graph.nodes) > nodes_before:
+                stats["new_nodes"] = stats.get("new_nodes", 0) + 1
+            else:
+                stats["merge_hits"] = stats.get("merge_hits", 0) + 1
         path.append(child_key)
         path_moves.append(move)
         child = graph.nodes[child_key]

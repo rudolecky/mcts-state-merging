@@ -176,6 +176,7 @@ def backup(graph: MCTSGraph, path: list, path_moves: list, value: float) -> None
 def run_search(
     start_state: frozenset, goal: frozenset, task,
     config: GUCTUniformConfig, budget: int, rng: random.Random, heuristic,
+    stats: dict | None = None,
 ) -> MCTSGraph:
     """budget counts EXPANSIONS, matching every other classical module's
     accounting exactly. No rollout_depth -- evaluation is one heuristic call,
@@ -211,7 +212,13 @@ def run_search(
     (this was the actual dominant cost in early testing, not the cycle-block
     case above -- ~99% of iterations at a modest budget were wasted
     re-confirming an already-found goal). A terminal's value needs exactly
-    one visit; close its edge immediately after that first backup too."""
+    one visit; close its edge immediately after that first backup too.
+
+    stats, if provided, gets "new_nodes"/"merge_hits" counters incremented
+    -- see RUBIKS_CUBE_FINDINGS.md's mechanism section, ported here to
+    compare directly against the cube's own budget-accounting trace, since
+    Blocksworld is the one domain among five where GUCT-Uniform still
+    shows a persistent tree-vs-merge gap rather than parity."""
     graph = create_root(start_state, goal, task, config.merge_enabled, heuristic)
     expansions_used = 0
     iterations = 0
@@ -231,8 +238,14 @@ def run_search(
             parent = graph.nodes[path[-2]]
             parent.children[path_moves[-1]].closed = True
             continue
+        nodes_before = len(graph.nodes)
         child_key, op = expand(graph, path[-1], goal, task, config, rng, heuristic)
         expansions_used += 1
+        if stats is not None:
+            if len(graph.nodes) > nodes_before:
+                stats["new_nodes"] = stats.get("new_nodes", 0) + 1
+            else:
+                stats["merge_hits"] = stats.get("merge_hits", 0) + 1
         path.append(child_key)
         path_moves.append(op)
         child = graph.nodes[child_key]
