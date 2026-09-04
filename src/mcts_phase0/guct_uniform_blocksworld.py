@@ -56,11 +56,36 @@ class MCTSGraph:
     nodes: dict
     root_key: object
     next_id: int = 0  # baseline-mode node-id counter; see expand()
+    seen_states: set = field(default_factory=set)
+    """Reject-duplicates arm only, where node keys are the counter, so
+    `nodes` cannot answer "has this state been seen"."""
+    rejected: int = 0
 
 
 @dataclass
 class GUCTUniformConfig:
     merge_enabled: bool
+    reject_duplicates: bool = False
+    """Third arm, only meaningful with `merge_enabled=False`: compute the
+    merge key but DISCARD an expansion landing on an already-seen state
+    rather than pooling into the existing node.
+
+    This is the crossing that the classical UCB1 work left open. Under
+    UCB1 with Monte-Carlo-average backup, merging's harm was traced
+    entirely to statistic pooling: not pooling fixed the Rubik's Cube
+    catastrophe outright and beat merging on Blocksworld
+    (results/ARTICLE_DERIVED_MERGING_FINDINGS.md). Separately, swapping
+    the backup rule for Full-Bellman-minimum plus LCB1-Uniform also
+    removed the harm. So there are two independent fixes for what looks
+    like one problem, and nobody has run them together. Blocksworld is
+    the sharp test: this is the one domain where GUCT-Uniform still shows
+    a large merge-over-tree gap (tree flat near 3-5% across a 40x budget
+    range, merge reaching 99%), so there is a real effect here for the
+    filter to either reproduce or fail to."""
+
+    def __post_init__(self):
+        if self.merge_enabled and self.reject_duplicates:
+            raise ValueError("reject_duplicates is only meaningful with merge_enabled=False")
 
 
 def _make_node(state: frozenset, goal: frozenset, task, heuristic) -> MCTSNode:
@@ -75,11 +100,13 @@ def _make_node(state: frozenset, goal: frozenset, task, heuristic) -> MCTSNode:
     )
 
 
-def create_root(start_state: frozenset, goal: frozenset, task, merge_enabled: bool, heuristic) -> MCTSGraph:
+def create_root(start_state: frozenset, goal: frozenset, task, merge_enabled: bool, heuristic,
+                reject_duplicates: bool = False) -> MCTSGraph:
     root = _make_node(start_state, goal, task, heuristic)
     if merge_enabled:
         return MCTSGraph(nodes={start_state: root}, root_key=start_state)
-    return MCTSGraph(nodes={0: root}, root_key=0, next_id=1)
+    seen = {start_state} if reject_duplicates else set()
+    return MCTSGraph(nodes={0: root}, root_key=0, next_id=1, seen_states=seen)
 
 
 def _lcb1_uniform_score(edge: MCTSEdge, T: int) -> float:
@@ -131,7 +158,7 @@ def select(graph: MCTSGraph, config: GUCTUniformConfig) -> tuple[list[object], l
 def expand(
     graph: MCTSGraph, leaf_key: object, goal: frozenset, task,
     config: GUCTUniformConfig, rng: random.Random, heuristic,
-) -> tuple[object, object]:
+) -> tuple[object, object] | None:
     """Baseline (no-merge) keys are a plain incrementing counter, not a
     path-move tuple like every other module here: pyperplan's `Operator`
     hashes by rehashing its precondition/effect frozensets on every call
@@ -142,19 +169,27 @@ def expand(
     gives the same guarantee (every baseline node is globally unique, so it
     never merges) at O(1) cost regardless of depth."""
     node = graph.nodes[leaf_key]
-    op = rng.choice(node.untried_moves)
-    node.untried_moves.remove(op)
-    new_state = apply_move(node.state, op)
+    while node.untried_moves:
+        op = rng.choice(node.untried_moves)
+        node.untried_moves.remove(op)
+        new_state = apply_move(node.state, op)
 
-    if config.merge_enabled:
-        child_key = new_state
-    else:
-        child_key = graph.next_id
-        graph.next_id += 1
-    if child_key not in graph.nodes:
-        graph.nodes[child_key] = _make_node(new_state, goal, task, heuristic)
-    node.children[op] = MCTSEdge(child_key=child_key)
-    return child_key, op
+        if config.reject_duplicates:
+            if new_state in graph.seen_states:
+                graph.rejected += 1
+                continue  # admission filter: already reached, try another move
+            graph.seen_states.add(new_state)
+
+        if config.merge_enabled:
+            child_key = new_state
+        else:
+            child_key = graph.next_id
+            graph.next_id += 1
+        if child_key not in graph.nodes:
+            graph.nodes[child_key] = _make_node(new_state, goal, task, heuristic)
+        node.children[op] = MCTSEdge(child_key=child_key)
+        return child_key, op
+    return None  # reject arm only: every remaining move led somewhere seen
 
 
 def backup(graph: MCTSGraph, path: list, path_moves: list, value: float) -> None:
@@ -219,7 +254,8 @@ def run_search(
     compare directly against the cube's own budget-accounting trace, since
     Blocksworld is the one domain among five where GUCT-Uniform still
     shows a persistent tree-vs-merge gap rather than parity."""
-    graph = create_root(start_state, goal, task, config.merge_enabled, heuristic)
+    graph = create_root(start_state, goal, task, config.merge_enabled, heuristic,
+                        config.reject_duplicates)
     expansions_used = 0
     iterations = 0
     max_iterations = 20 * budget
@@ -239,7 +275,30 @@ def run_search(
             parent.children[path_moves[-1]].closed = True
             continue
         nodes_before = len(graph.nodes)
-        child_key, op = expand(graph, path[-1], goal, task, config, rng, heuristic)
+        expanded = expand(graph, path[-1], goal, task, config, rng, heuristic)
+        if expanded is None:
+            # Reject arm: this leaf's every remaining move led somewhere
+            # already reached. Retry with NO backup -- re-feeding a frozen
+            # sample through an edge is what makes LCB1-Uniform's score
+            # diverge toward -inf and lock the search into a dead lane (see
+            # this function's docstring).
+            #
+            # Close the edge into the leaf ONLY when the leaf has no live
+            # child edge left. Closing it unconditionally, as the
+            # cycle-block case above can afford to (that leaf is fully
+            # expanded with every child on the current path), would prune
+            # the leaf's whole unexplored subtree here -- the leaf may have
+            # perfectly good children and merely have run out of NEW moves.
+            # Measured: closing unconditionally dropped the 3-block solve
+            # rate to 3/10.
+            leaf_node = graph.nodes[path[-1]]
+            if any(not e.closed for e in leaf_node.children.values()):
+                continue  # select() will descend past it next time
+            if len(path) > 1:
+                graph.nodes[path[-2]].children[path_moves[-1]].closed = True
+                continue
+            break  # the root itself has nothing admissible left
+        child_key, op = expanded
         expansions_used += 1
         if stats is not None:
             if len(graph.nodes) > nodes_before:

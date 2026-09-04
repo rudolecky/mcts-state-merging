@@ -225,3 +225,50 @@ def test_run_search_stats_counts_new_nodes_and_merge_hits():
     assert total <= 50  # <= since a small puzzle's whole reachable graph can exhaust before budget
     assert total > 0
     assert stats.get("new_nodes", 0) > 0
+
+
+# ---------- reject-duplicates arm under Full-Bellman-min backup ----------
+
+def test_reject_duplicates_is_refused_alongside_merging():
+    import pytest
+    with pytest.raises(ValueError):
+        GUCTUniformConfig(merge_enabled=True, reject_duplicates=True)
+
+
+_ALL_ON_TABLE_3 = frozenset({
+    "ontable(1)", "ontable(2)", "ontable(3)",
+    "clear(1)", "clear(2)", "clear(3)", "handempty",
+})
+
+
+def test_reject_duplicates_keeps_states_unique_and_never_pools():
+    """The crossing this arm exists to test: dedup without pooling, under a
+    backup rule that already removes merging's harm by itself."""
+    task = make_task(3)
+    goal = goal_state(3)
+    heuristic = hFFHeuristic(task)
+    config = GUCTUniformConfig(merge_enabled=False, reject_duplicates=True)
+    graph = run_search(_ALL_ON_TABLE_3, goal, task, config, budget=60, rng=random.Random(0),
+                       heuristic=heuristic)
+
+    assert graph.rejected > 0  # Blocksworld is dense in transpositions
+    in_degree = {}
+    for node in graph.nodes.values():
+        for edge in node.children.values():
+            in_degree[edge.child_key] = in_degree.get(edge.child_key, 0) + 1
+    assert all(d == 1 for d in in_degree.values())  # still a tree
+    states = [n.state for n in graph.nodes.values()]
+    assert len(set(states)) == len(states)  # every node a distinct state
+
+
+def test_reject_duplicates_still_solves_a_small_puzzle():
+    task = make_task(3)
+    goal = goal_state(3)
+    heuristic = hFFHeuristic(task)
+    solved = 0
+    for seed in range(10):
+        config = GUCTUniformConfig(merge_enabled=False, reject_duplicates=True)
+        graph = run_search(_ALL_ON_TABLE_3, goal, task, config, budget=60, rng=random.Random(seed),
+                           heuristic=heuristic)
+        solved += is_solved(graph)
+    assert solved >= 8

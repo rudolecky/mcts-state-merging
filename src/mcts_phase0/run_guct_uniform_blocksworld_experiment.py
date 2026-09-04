@@ -23,12 +23,13 @@ from .guct_uniform_blocksworld import GUCTUniformConfig, is_solved, run_search
 from .run_classical_mcts_experiment import _bootstrap_ci_mean_diff
 
 
-def _solve_rate(instance, task, goal, heuristic, merge_enabled: bool, budget: int, repeats: int, base_seed: int) -> tuple[float, float]:
+def _solve_rate(instance, task, goal, heuristic, merge_enabled: bool, budget: int, repeats: int, base_seed: int,
+                reject_duplicates: bool = False) -> tuple[float, float]:
     solved = 0
     node_counts = []
     for r in range(repeats):
         rng = random.Random(base_seed * 100_003 + r)
-        config = GUCTUniformConfig(merge_enabled=merge_enabled)
+        config = GUCTUniformConfig(merge_enabled=merge_enabled, reject_duplicates=reject_duplicates)
         graph = run_search(instance.start_state, goal, task, config, budget, rng, heuristic)
         if is_solved(graph):
             solved += 1
@@ -44,6 +45,13 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--budgets", type=int, nargs="+", default=[25, 50, 100, 200])
     ap.add_argument("--repeats", type=int, default=50)
+    ap.add_argument("--reject-duplicates", action="store_true",
+                    help="make the treatment arm the admission filter instead of merging. This "
+                         "crosses the two independent fixes for merging's harm that have never "
+                         "been run together: not pooling statistics, and swapping the backup rule "
+                         "for Full-Bellman-minimum + LCB1-Uniform. Blocksworld is the sharp test, "
+                         "being the one domain where GUCT-Uniform still shows a large "
+                         "merge-over-tree gap.")
     ap.add_argument("--output-dir", default="results/guct_uniform_blocksworld_experiment")
     args = ap.parse_args()
 
@@ -62,7 +70,10 @@ def main():
         rows = []
         for i, inst in enumerate(puzzles):
             base_rate, base_nodes = _solve_rate(inst, task, goal, heuristic, False, budget, args.repeats, base_seed=args.seed * 1000 + i)
-            treat_rate, treat_nodes = _solve_rate(inst, task, goal, heuristic, True, budget, args.repeats, base_seed=args.seed * 1000 + i)
+            treat_rate, treat_nodes = _solve_rate(inst, task, goal, heuristic,
+                                                  not args.reject_duplicates, budget, args.repeats,
+                                                  base_seed=args.seed * 1000 + i,
+                                                  reject_duplicates=args.reject_duplicates)
             rows.append({
                 "id": inst.id, "plan_length": inst.plan_length,
                 "baseline_rate": base_rate, "treatment_rate": treat_rate,
@@ -93,7 +104,8 @@ def main():
     elapsed = time.time() - start
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"results_seed{args.seed}.json"
+    suffix = "_reject" if args.reject_duplicates else ""
+    out_path = out_dir / f"results_seed{args.seed}{suffix}.json"
     with open(out_path, "w") as f:
         json.dump({"args": vars(args), "elapsed_sec": elapsed, "results": results}, f, indent=2)
     print(f"done in {elapsed:.1f}s -> {out_path}")
