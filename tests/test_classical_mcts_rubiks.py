@@ -288,3 +288,48 @@ def test_expand_merges_normally_when_under_the_visit_cap():
     child_key = expand(graph, rc.SOLVED, path_moves=(), config=config, rng=rng)
 
     assert child_key == target_state  # merged normally, still under the cap
+
+
+# ---------- reject-duplicates arm (admission filter, no statistic pooling) ----------
+
+def test_reject_duplicates_keeps_states_unique_and_never_pools():
+    scrambled = rc.apply_move(rc.SOLVED, rc.ALL_MOVES[0])
+    config = ClassicalMCTSConfig(merge_enabled=False, reject_duplicates=True)
+    graph = run_search(scrambled, config, budget=200, rollout_depth=5, rng=random.Random(0))
+
+    assert graph.rejected > 0  # the cube is the densest transposition domain here
+    in_degree = {}
+    for node in graph.nodes.values():
+        for edge in node.children.values():
+            in_degree[edge.child_key] = in_degree.get(edge.child_key, 0) + 1
+    assert all(d == 1 for d in in_degree.values())
+    assert all(n.parent_count <= 1 for n in graph.nodes.values())
+
+    states = [n.state for n in graph.nodes.values()]
+    assert len(set(states)) == len(states)
+
+
+def test_reject_duplicates_expansion_can_fail_without_crashing_the_search():
+    scrambled = rc.apply_move(rc.SOLVED, rc.ALL_MOVES[0])
+    config = ClassicalMCTSConfig(merge_enabled=False, reject_duplicates=True)
+    graph = create_root(scrambled, merge_enabled=False, reject_duplicates=True)
+    root = graph.nodes[graph.root_key]
+    for move in list(root.untried_moves):
+        graph.seen_states.add(rc.apply_move(root.state, rc.ALL_MOVES[move]))
+    assert expand(graph, graph.root_key, (), config, random.Random(0)) is None
+    assert root.untried_moves == []
+
+
+def test_reject_duplicates_solves_a_one_move_scramble_where_merging_is_catastrophic():
+    """Merging drops the cube's solve rate to exactly zero (see
+    RUBIKS_CUBE_FINDINGS.md). This arm gets merging's distinctness without
+    its statistic pooling, so it should behave like the tree arm."""
+    scrambled = rc.apply_move(rc.SOLVED, rc.ALL_MOVES[0])
+    solved_count = 0
+    trials = 20
+    for seed in range(trials):
+        config = ClassicalMCTSConfig(merge_enabled=False, reject_duplicates=True)
+        graph = run_search(scrambled, config, budget=20, rollout_depth=5, rng=random.Random(seed))
+        if is_solved(graph):
+            solved_count += 1
+    assert solved_count >= trials * 0.7

@@ -40,12 +40,24 @@ class MCTSNode:
     is_terminal: bool = False
     terminal_value: float | None = None  # 1.0 iff this state is the goal
     parent_count: int = 0  # distinct parents merged into this node -- see merge_parent_cap
+    exhausted: bool = False
+    """Reject-duplicates arm only: this node has no untried moves left and
+    `select()` could not descend past it, so nothing new can ever come from
+    it. Without marking it, it stays the most attractive frontier node its
+    parent has and gets re-selected for rollout-only iterations forever --
+    burning the iteration allowance (20x budget) without spending a single
+    expansion, so the arm silently runs at a fraction of the budget the
+    other arms get. Marked nodes are excluded from `select()`."""
 
 
 @dataclass
 class MCTSGraph:
     nodes: dict[object, MCTSNode]
     root_key: object
+    seen_states: set = field(default_factory=set)
+    """Only populated in the reject-duplicates arm, where node keys are
+    path-based, so `nodes` cannot answer "has this state been seen"."""
+    rejected: int = 0
 
 
 @dataclass
@@ -81,7 +93,36 @@ class ClassicalMCTSConfig:
     its own exploration bonus, and gets exploited disproportionately
     regardless of true quality, independent of how many distinct parents
     fed it those visits."""
+    reject_duplicates: bool = False
+    """Third arm, only meaningful with `merge_enabled=False`: keep
+    path-based node keys -- so no statistics are ever pooled and the backup
+    rule is untouched -- but DISCARD an expansion landing on a state seen
+    anywhere in this search, trying another untried move instead. Ordinary
+    merging does two things at once: it makes expansions land on distinct
+    states, and it pools statistics from every path that reaches one. Both
+    capping mitigations in this module attacked the second half indirectly
+    (by refusing merges) and both failed as a cliff. This arm removes the
+    second half outright while keeping the first, which is the version the
+    cube's all-or-nothing failure predicts should be safe.
 
+    Budget accounting: a rejected move never becomes an expansion, so it
+    does not count against the expansion budget -- consistent with this
+    project's convention that budget counts expansions. It does cost a real
+    `apply_move`, though, so this arm does strictly more work per unit of
+    budget than the other two; that difference shows up only in wall-clock,
+    which is why wall-clock is reported next to every arm's node count."""
+
+
+
+    def __post_init__(self):
+        if self.merge_enabled and self.reject_duplicates:
+            # These two do not compose, and the way they fail to compose
+            # differs per module (one silently disables merging, another
+            # silently ignores the rejection), so the combination is
+            # refused rather than left to mean whatever the code happens
+            # to do. `reject_duplicates` is an alternative to merging, not
+            # a modifier of it.
+            raise ValueError("reject_duplicates is only meaningful with merge_enabled=False")
 
 def _make_node(state: rc.State) -> MCTSNode:
     is_terminal = rc.is_goal(state)
@@ -93,10 +134,11 @@ def _make_node(state: rc.State) -> MCTSNode:
     )
 
 
-def create_root(start_state: rc.State, merge_enabled: bool) -> MCTSGraph:
+def create_root(start_state: rc.State, merge_enabled: bool, reject_duplicates: bool = False) -> MCTSGraph:
     root_key = start_state if merge_enabled else ()
     root = MCTSNode(state=start_state, untried_moves=list(range(len(rc.ALL_MOVES))))
-    return MCTSGraph(nodes={root_key: root}, root_key=root_key)
+    seen = {start_state} if reject_duplicates else set()
+    return MCTSGraph(nodes={root_key: root}, root_key=root_key, seen_states=seen)
 
 
 def _ucb1_score(parent: MCTSNode, edge: MCTSEdge, child: MCTSNode, c: float) -> float:
@@ -111,7 +153,8 @@ def select(graph: MCTSGraph, config: ClassicalMCTSConfig) -> tuple[list[object],
     path_moves: tuple[int, ...] = ()
     node = graph.nodes[graph.root_key]
     while not node.is_terminal and not node.untried_moves and node.children:
-        candidates = {m: e for m, e in node.children.items() if e.child_key not in path}
+        candidates = {m: e for m, e in node.children.items()
+                      if e.child_key not in path and not graph.nodes[e.child_key].exhausted}
         if not candidates:
             break  # every child would revisit an ancestor on this path
         best_move = max(
@@ -129,12 +172,27 @@ def _find_or_add_edge(parent: MCTSNode, move: int, child_key: object) -> None:
     parent.children[move] = MCTSEdge(child_key=child_key)
 
 
-def expand(graph: MCTSGraph, leaf_key: object, path_moves: tuple[int, ...], config: ClassicalMCTSConfig, rng: random.Random) -> object:
+def expand(graph: MCTSGraph, leaf_key: object, path_moves: tuple[int, ...], config: ClassicalMCTSConfig, rng: random.Random) -> object | None:
+    """Returns the child key, or None only in the reject-duplicates arm
+    when every remaining untried move led to an already-seen state -- the
+    caller then treats this leaf like a fully-expanded one, the same
+    fallback it already uses when `select()` gives up on a cycle."""
     node = graph.nodes[leaf_key]
-    move = rng.choice(node.untried_moves)
-    node.untried_moves.remove(move)
-    new_state = rc.apply_move(node.state, rc.ALL_MOVES[move])
+    while node.untried_moves:
+        move = rng.choice(node.untried_moves)
+        node.untried_moves.remove(move)
+        new_state = rc.apply_move(node.state, rc.ALL_MOVES[move])
+        if config.reject_duplicates:
+            if new_state in graph.seen_states:
+                graph.rejected += 1
+                continue  # admission filter: this state exists already, try another move
+            graph.seen_states.add(new_state)
+        return _attach_child(graph, node, move, new_state, path_moves, config)
+    return None
 
+
+def _attach_child(graph: MCTSGraph, node: MCTSNode, move: int, new_state: rc.State,
+                  path_moves: tuple[int, ...], config: ClassicalMCTSConfig) -> object:
     use_merge = config.merge_enabled
     if use_merge and new_state in graph.nodes:
         target = graph.nodes[new_state]
@@ -180,6 +238,26 @@ def _leaf_value(state: rc.State, rollout_depth: int, config: ClassicalMCTSConfig
     return simulate(state, rollout_depth, rng)
 
 
+def _mark_exhausted(graph: MCTSGraph, leaf_key: object, leaf: MCTSNode, config: ClassicalMCTSConfig) -> bool:
+    """Reject-duplicates arm only. Marks a dead frontier node so `select()`
+    stops returning it, and reports whether the search is finished -- which
+    is the case exactly when the dead node is the root, since `select()` can
+    only return an exhausted node with no non-exhausted alternative above
+    it."""
+    if not config.reject_duplicates:
+        return False
+    if leaf.untried_moves:
+        return False
+    if any(not graph.nodes[e.child_key].exhausted for e in leaf.children.values()):
+        # Still has a live subtree. `select()` returns nodes that have BOTH
+        # untried moves and existing children, so a node whose remaining
+        # untried moves were all rejected is NOT dead -- marking it here
+        # would make `select()` skip it and orphan every live descendant.
+        return False
+    leaf.exhausted = True
+    return leaf_key == graph.root_key
+
+
 def backup(graph: MCTSGraph, path: list[object], value: float) -> None:
     for i, key in enumerate(path):
         node = graph.nodes[key]
@@ -203,7 +281,7 @@ def run_search(
     RUBIKS_CUBE_FINDINGS.md's mechanism section: this distinguishes an
     expansion that grows the tree's own distinct-node count from one that
     only adds another parent pointer to an already-known state."""
-    graph = create_root(start_state, config.merge_enabled)
+    graph = create_root(start_state, config.merge_enabled, config.reject_duplicates)
     expansions_used = 0
     iterations = 0
     max_iterations = 20 * budget
@@ -217,9 +295,19 @@ def run_search(
         if not leaf.untried_moves:
             value = _leaf_value(leaf.state, rollout_depth, config, rng, distances)
             backup(graph, path, value)
+            if _mark_exhausted(graph, path[-1], leaf, config):
+                break
             continue
         nodes_before = len(graph.nodes)
         child_key = expand(graph, path[-1], path_moves, config, rng)
+        if child_key is None:
+            # reject-duplicates arm: every remaining untried move led
+            # somewhere already seen. Same fallback as the cycle-block case.
+            value = _leaf_value(leaf.state, rollout_depth, config, rng, distances)
+            backup(graph, path, value)
+            if _mark_exhausted(graph, path[-1], leaf, config):
+                break
+            continue
         expansions_used += 1
         if stats is not None:
             if len(graph.nodes) > nodes_before:

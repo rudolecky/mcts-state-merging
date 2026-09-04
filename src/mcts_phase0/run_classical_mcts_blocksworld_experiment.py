@@ -20,12 +20,13 @@ from .datasets import blocksworld_engine
 from .run_classical_mcts_experiment import _bootstrap_ci_mean_diff
 
 
-def _solve_rate(instance, task, goal, merge_enabled: bool, budget: int, rollout_depth: int, repeats: int, base_seed: int) -> tuple[float, float]:
+def _solve_rate(instance, task, goal, merge_enabled: bool, budget: int, rollout_depth: int, repeats: int, base_seed: int,
+                reject_duplicates: bool = False) -> tuple[float, float]:
     solved = 0
     node_counts = []
     for r in range(repeats):
         rng = random.Random(base_seed * 100_003 + r)
-        config = ClassicalMCTSConfig(merge_enabled=merge_enabled)
+        config = ClassicalMCTSConfig(merge_enabled=merge_enabled, reject_duplicates=reject_duplicates)
         graph = run_search(instance.start_state, goal, task, config, budget, rollout_depth, rng)
         if is_solved(graph):
             solved += 1
@@ -42,6 +43,12 @@ def main():
     ap.add_argument("--budgets", type=int, nargs="+", default=[25, 50, 100, 200])
     ap.add_argument("--repeats", type=int, default=50)
     ap.add_argument("--rollout-depth", type=int, default=30)
+    ap.add_argument("--reject-duplicates", action="store_true",
+                    help="make the treatment arm the admission filter instead of merging: "
+                         "keep path-based node keys (no statistic pooling, backup rule "
+                         "untouched) but discard an expansion landing on an already-seen "
+                         "state. Blocksworld is this project's largest merge win, so this "
+                         "is the sharpest test of which half of merging that win comes from.")
     ap.add_argument("--output-dir", default="results/classical_mcts_blocksworld_experiment")
     args = ap.parse_args()
 
@@ -58,7 +65,9 @@ def main():
         rows = []
         for i, inst in enumerate(puzzles):
             base_rate, base_nodes = _solve_rate(inst, task, goal, False, budget, args.rollout_depth, args.repeats, base_seed=args.seed * 1000 + i)
-            treat_rate, treat_nodes = _solve_rate(inst, task, goal, True, budget, args.rollout_depth, args.repeats, base_seed=args.seed * 1000 + i)
+            treat_rate, treat_nodes = _solve_rate(inst, task, goal, not args.reject_duplicates, budget, args.rollout_depth,
+                                                  args.repeats, base_seed=args.seed * 1000 + i,
+                                                  reject_duplicates=args.reject_duplicates)
             rows.append({
                 "id": inst.id, "plan_length": inst.plan_length,
                 "baseline_rate": base_rate, "treatment_rate": treat_rate,
@@ -89,7 +98,12 @@ def main():
     elapsed = time.time() - start
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"results_seed{args.seed}.json"
+    # The arm is in the filename: the treatment arm is merge or reject depending
+    # on --reject-duplicates, and both keep the `treatment_*` keys, so a shared
+    # filename would let one silently overwrite the other's record with a
+    # differently-defined "treatment".
+    suffix = "_reject" if args.reject_duplicates else ""
+    out_path = out_dir / f"results_seed{args.seed}{suffix}.json"
     with open(out_path, "w") as f:
         json.dump({"args": vars(args), "elapsed_sec": elapsed, "results": results}, f, indent=2)
     print(f"done in {elapsed:.1f}s -> {out_path}")
