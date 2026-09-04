@@ -67,6 +67,20 @@ mostly a property of the search algorithm's backup rule and of whether plain tre
 domain gets permanently trapped without it, not a fixed property of how much redundant structure a
 domain has.
 
+A later result sharpens that conclusion by splitting merging in two. Merging does two things at
+once: it makes expansions land on distinct states, and it pools the statistics of every path that
+reaches one. A third mode was added that keeps only the first, called reject mode: the search
+computes the same state key, but when an expansion lands on a state already seen anywhere it
+discards that move and tries another, keeping ordinary path based node keys so no statistics are
+ever pooled and the backup rule is left alone. On the Rubik's Cube this fixes the catastrophe
+outright, solving every puzzle at every budget and difficulty where merging solves none, and it
+beats plain tree search at the tighter budgets rather than merely matching it. On Blocksworld it
+beats merging itself at every budget, most visibly where budget is scarce. On ARC AGI it is null,
+like every other change tried on that domain. So the harm merging can do was never in
+deduplication at all, only in what the backup rule does with pooled statistics, and declining to
+pool is a third option that neither of the earlier capping mitigations approximated. The cost is
+wall clock: a rejected move still pays for the state it computed and threw away.
+
 ## Repository layout
 
 * `src/mcts_phase0/`: all search algorithms and domain engines.
