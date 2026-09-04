@@ -14,14 +14,18 @@ oracle (the DSL program space is unbounded, no exhaustive reachability
 table is feasible) and no pre-existing heuristic at all
 (`classical_mcts_arc_program.py` uses blind 0/1 rollout only). `_arc_heuristic`
 is new: for each training example, 1 minus the fraction of grid cells
-where the program's *current final context value* (`ctx[-1]`, the exact
-value `is_goal` itself checks) matches that example's target output grid,
-summed across examples. Deliberately restricted to `ctx[-1]` only (not
-scanning earlier context values for a partial match elsewhere in the
-program) so that h=0.0 if and only if `is_goal` is True -- scanning every
-context value risked a state where some *other*, non-final value happened
-to match a target while the actual current output didn't, spuriously
-zeroing the heuristic at a state `is_goal` disagrees is solved.
+matching that example's target output grid, summed across examples, and
+evaluated at whichever context index comes closest (via
+`engine.goal_progress`).
+
+It used to read `ctx[-1]`, the most recently produced value, which was a
+genuine merge/tree asymmetry: `canonical_key` is order-independent and so
+does not determine which value is last, meaning the merge arm scored a node
+with whichever ordering happened to create it while the tree arm scored
+each ordering separately. That matters more here than anywhere else in the
+ARC work, because GUCT-Uniform is entirely h-driven -- there are no
+rollouts to wash it out. Evaluating at the best index makes h a function of
+the merge key and restores `h == 0.0` iff `is_goal` in both directions.
 
 Node keying mirrors `classical_mcts_arc_program.py`'s own convention
 exactly: `canonical_key` (order-independent set of the program's
@@ -78,32 +82,30 @@ class GUCTUniformConfig:
 
 
 def _grid_overlap_fraction(candidate, target) -> float:
-    """Real bug caught during calibration: checking only that candidate[0]
-    is a tuple isn't enough to confirm candidate is a Grid (Tuple[Tuple[Integer]])
-    -- other DSL types are also tuples-of-tuples-looking in their first
-    element (e.g. a jagged structure whose row 0 happens to be a nested
-    tuple but a later "row" is a bare int), and crashed zip(r1, r2) with
-    'int is not iterable' the first time a non-Grid tuple value reached
-    this function. Every row is now validated as its own tuple, and every
-    row's length is checked against target's corresponding row, not just
-    row 0's -- any mismatch falls through to 0.0 (no partial credit)
-    instead of crashing."""
-    if not isinstance(candidate, tuple) or not candidate:
-        return 0.0
-    if not all(isinstance(row, tuple) for row in candidate):
-        return 0.0
-    if len(candidate) != len(target) or any(len(r1) != len(r2) for r1, r2 in zip(candidate, target)):
-        return 0.0
-    total = sum(len(row) for row in candidate)
-    matches = sum(1 for r1, r2 in zip(candidate, target) for c1, c2 in zip(r1, r2) if c1 == c2)
-    return matches / total
+    """Thin alias for `engine.grid_overlap_fraction`, where this function's
+    body (and the real jagged-tuple crash it was hardened against) now
+    lives, so the classical module's graded reward and this heuristic
+    share one implementation instead of two copies that can drift."""
+    return engine.grid_overlap_fraction(candidate, target)
 
 
 def _arc_heuristic(program_state: engine.ProgramState, target_outputs: tuple) -> float:
-    return sum(
-        1.0 - _grid_overlap_fraction(ctx[-1], target)
-        for ctx, target in zip(program_state.contexts, target_outputs)
-    )
+    """Per-example mismatch summed across examples, evaluated at whichever
+    context index comes closest to the targets.
+
+    Reading `ctx[-1]` instead -- the most recently produced value -- was a
+    real merge/tree asymmetry, and a worse one than the `is_goal` version of
+    the same mistake. `canonical_key` is order-independent, so it does not
+    determine which value is last; the merge arm therefore kept whichever
+    ordering created the node first while the tree arm got each ordering's
+    own h. GUCT-Uniform is entirely h-driven (no rollouts), so the two arms
+    were scoring different things everywhere, not just at the goal test.
+
+    Taking the best index makes h a function of the merge key, since
+    `goal_progress` depends only on the set of per-example value tuples.
+    It also restores the `h == 0.0` iff `is_goal` equivalence exactly, in
+    both directions, which the `ctx[-1]` form only had in one."""
+    return len(program_state.contexts) * (1.0 - engine.goal_progress(program_state, target_outputs))
 
 
 def _make_node(program_state: engine.ProgramState, target_outputs: tuple, config: GUCTUniformConfig, rng: random.Random) -> MCTSNode:

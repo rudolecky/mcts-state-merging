@@ -176,7 +176,7 @@ def legal_moves(state: ProgramState, rng: random.Random, sample_size: int = 25) 
     exhaustive enumeration -- branching factor with the full curated
     function set and a growing context would otherwise explode. See this
     module's docstring."""
-    moves = set()
+    moves = set()  # deduplicates; ORDER comes from the sort below, never from the set
     attempts = 0
     max_attempts = sample_size * 20
     funcs = list(CURATED_FUNCTIONS)
@@ -194,7 +194,17 @@ def legal_moves(state: ProgramState, rng: random.Random, sample_size: int = 25) 
         if not ok:
             continue
         moves.add((func, tuple(arg_specs)))
-    return list(moves)
+    # Sorted, not `list(moves)`. A set of tuples containing strings iterates
+    # in hash order, and Python randomizes string hashes per process
+    # (PYTHONHASHSEED), so `list(moves)` made every ARC search depend on
+    # which process it ran in: identical seeds gave different move orders,
+    # hence different `rng.choice` picks and different `rng.shuffle` results
+    # in `simulate`. Confirmed directly -- the same state and seed under two
+    # hash seeds returned two different orderings, and two runs of the same
+    # experiment config disagreed on 2 of 12 per-task solve rates.
+    # `key=repr` because arg_specs mix ('ctx', int) with ('const', str),
+    # which are not mutually orderable.
+    return sorted(moves, key=repr)
 
 
 def apply_move(state: ProgramState, move) -> ProgramState:
@@ -242,15 +252,168 @@ def apply_move(state: ProgramState, move) -> ProgramState:
     return ProgramState(contexts=tuple(new_contexts), type_schema=state.type_schema + (new_value_tag,))
 
 
+def goal_index(state: ProgramState, target_outputs: tuple) -> int | None:
+    """The lowest context index whose per-example values are exactly the
+    target outputs, or None if no index matches.
+
+    Checked at EVERY index, not just the last one, so that goal-ness is a
+    function of the merge key. `canonical_key` is order-independent, so a
+    state holding the target at index i and one holding it at index j can
+    share a key; a last-value-only test would therefore depend on
+    information the key does not carry, while the merge arm caches
+    `is_terminal` from whichever ordering created the node first.
+
+    That inconsistency is real but, as it stands, **unreachable** -- this is
+    an invariant repair, not a bug fix, and it was checked rather than
+    assumed. A state holding the target at a non-final index can only be
+    produced by expanding its own prefix, and that prefix holds the target
+    at *its* last index, so even the old test marks the prefix terminal and
+    gives it no untried moves. It is never expanded, so the non-final-goal
+    state is never created. Measured: over 60k node creations across all 32
+    curated tasks, both goal tests agreed every time, and no experiment
+    result moved.
+
+    It is kept because it costs nothing (see `last_value_is_goal` for the
+    hot path), because the invariant should not depend on an expansion-order
+    argument holding forever, and because it is the right test on its own
+    terms: a program that produced the target output has solved the task
+    whether or not it computed something else afterwards. The same principle
+    applied to `guct_uniform_arc._arc_heuristic`, where the equivalent
+    inconsistency IS reachable, did change results.
+    """
+    for i in range(len(state.type_schema)):
+        if all(ctx[i] == target for ctx, target in zip(state.contexts, target_outputs)):
+            return i
+    return None
+
+
 def is_goal(state: ProgramState, target_outputs: tuple) -> bool:
+    return goal_index(state, target_outputs) is not None
+
+
+def last_value_is_goal(state: ProgramState, target_outputs: tuple) -> bool:
+    """Whether the MOST RECENTLY produced value matches every target -- the
+    O(1)-index incremental form of `is_goal`.
+
+    Sound wherever the caller already knows the state's other indices do
+    not match, which is exactly the situation inside a rollout: the walk
+    checks after every step, `apply_move` appends exactly one value, so
+    goal-ness can only newly arise from that value. Using the full
+    `is_goal` scan per step instead is equivalent but costs O(context
+    length) grid comparisons on every step of every rollout, which is a
+    large constant on deep nodes."""
     return all(ctx[-1] == target for ctx, target in zip(state.contexts, target_outputs))
 
 
-def canonical_key(state: ProgramState):
-    """Order-independent merge key: two states are the same if they hold
-    the same set of (type, per-example-values) entries, however they were
-    produced -- the direct ARC analogue of Blocksworld's frozenset state."""
-    return frozenset(
-        (tag, tuple(ctx[i] for ctx in state.contexts))
-        for i, tag in enumerate(state.type_schema)
-    )
+def last_value_progress(state: ProgramState, target_outputs: tuple) -> float:
+    """`goal_progress` restricted to the most recently produced value. The
+    running maximum over an incrementally extended walk is exactly
+    `goal_progress`, since each step adds one index and the max over all
+    indices is the max of (max so far, this index)."""
+    return sum(
+        grid_overlap_fraction(ctx[-1], target)
+        for ctx, target in zip(state.contexts, target_outputs)
+    ) / len(state.contexts)
+
+
+def grid_overlap_fraction(candidate, target) -> float:
+    """Cell-level agreement between a candidate context value and a target
+    output grid: 1.0 on an exact match of any value type, else the fraction
+    of matching cells if the two are same-shape grids, else 0.0. No
+    shape-mismatch metric is invented -- a wrong-shape value scores 0, the
+    same as a non-grid one -- so the only partial credit given is the part
+    that is unambiguous to measure.
+
+    Moved here from `guct_uniform_arc._grid_overlap_fraction`, which now
+    delegates to it, so the graded ARC signal has one implementation.
+    Real bug it already carries, caught during that module's calibration:
+    checking only that `candidate[0]` is a tuple isn't enough to confirm
+    candidate is a Grid (Tuple[Tuple[Integer]]) -- other DSL types also
+    look tuple-of-tuples in their first element (e.g. a jagged structure
+    whose row 0 happens to be a nested tuple but a later "row" is a bare
+    int), and that crashed `zip(r1, r2)` with 'int is not iterable' the
+    first time a non-Grid tuple value reached the function. Every row is
+    validated as its own tuple, and every row's length is checked against
+    target's corresponding row, not just row 0's."""
+    if candidate == target:
+        return 1.0
+    if not isinstance(candidate, tuple) or not candidate:
+        return 0.0
+    if not all(isinstance(row, tuple) for row in candidate):
+        return 0.0
+    # `target` gets the same validation as `candidate`. Real ARC targets are
+    # always grids, so this is unreachable today, but this is now a shared
+    # engine helper with two callers and a docstring that advertises
+    # robustness -- `len(target)` on a non-grid would raise TypeError.
+    if not isinstance(target, tuple) or not all(isinstance(row, tuple) for row in target):
+        return 0.0
+    if len(candidate) != len(target) or any(len(r1) != len(r2) for r1, r2 in zip(candidate, target)):
+        return 0.0
+    total = sum(len(row) for row in candidate)
+    matches = sum(1 for r1, r2 in zip(candidate, target) for c1, c2 in zip(r1, r2) if c1 == c2)
+    return matches / total
+
+
+def goal_progress(state: ProgramState, target_outputs: tuple) -> float:
+    """Graded counterpart to `is_goal`: the best over context indices of
+    the mean per-example similarity to that example's target output. Equals
+    1.0 exactly when `is_goal` is True.
+
+    Both axes the ARC verifier literature uses are present: the mean over
+    examples is "fraction of training examples matched" when every score is
+    0 or 1, and `grid_overlap_fraction` supplies the within-example
+    cell-level term. The motivation is that binary exact-match is the
+    sparsest reward signal of any domain in this repo, and merging works by
+    pooling statistics -- pooling zeros carries no information, which is a
+    candidate explanation for ARC showing this project's smallest merge
+    effect.
+
+    Maxed over context indices rather than read off `ctx[-1]`, for the same
+    reason `goal_index` scans every index: anything the merge key cannot
+    see must not change a state's value, or the merge and tree arms are
+    scoring different things."""
+    n = len(state.contexts)
+    best = 0.0
+    for i in range(len(state.type_schema)):
+        score = sum(
+            grid_overlap_fraction(ctx[i], target)
+            for ctx, target in zip(state.contexts, target_outputs)
+        ) / n
+        best = max(best, score)
+    return best
+
+
+def canonical_key(state: ProgramState, key_mode: str = "typed"):
+    """Order-independent merge key -- two states are the same if they hold
+    the same entries, however they were produced. The direct ARC analogue
+    of Blocksworld's frozenset state.
+
+    `key_mode` selects the equivalence relation:
+
+    * "typed" (default, original behavior): entries are
+      (type-tag-set, per-example-values) pairs.
+    * "values": entries are per-example-value tuples alone. Strictly
+      coarser, and closer to observational equivalence as bottom-up program
+      synthesis means it -- two states holding the same concrete values are
+      interchangeable for everything observable, whereas "typed" keeps them
+      apart whenever the same value was reached under different static tags
+      (which happens here: `apply_move`'s return-tag refinement assigns
+      different tag sets to the same value depending on the route taken,
+      and the higher-order consumers are tagged ANY). The approximation
+      this introduces is that the surviving node keeps the first arrival's
+      `type_schema`, so type-driven `legal_moves` sampling downstream is
+      the representative's, not the newcomer's -- the standard
+      representative-parent merge approximation, measured rather than
+      assumed.
+    """
+    if key_mode == "typed":
+        return frozenset(
+            (tag, tuple(ctx[i] for ctx in state.contexts))
+            for i, tag in enumerate(state.type_schema)
+        )
+    if key_mode == "values":
+        return frozenset(
+            tuple(ctx[i] for ctx in state.contexts)
+            for i in range(len(state.type_schema))
+        )
+    raise ValueError(f"unknown key_mode {key_mode!r}")
