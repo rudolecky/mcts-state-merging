@@ -276,3 +276,67 @@ point's result.
 stale. Migrated in place and verified that all six (dataset, tau) configurations still reproduce
 their reported solve counts exactly, so ~7h of computed search remains resumable — which matters
 because the top open item (a wider tau on Countdown) reuses that baseline.
+
+
+---
+
+# Wrap-up: the three closing steps
+
+## 1. Committed
+
+Branch `merging-mechanism-split`, six commits. Left uncommitted deliberately: `prosqa.py`,
+`test_prosqa.py`, `run_prosqa_reconvergence_probe.py`, `phase0-followup-plan.md`, the vendored
+arc-dsl README, and `data/` — all pre-existing work from before this thread, not mine to commit.
+
+**`results/` is gitignored, so no findings doc is version-controlled** — that is the repo's existing
+convention (nothing under `results/` has ever been tracked), but it means the five write-ups from
+this thread and ~7h of shards are still unprotected. Force-adding just the markdown would be a
+one-line change to that convention if wanted.
+
+## 2. Republished the two ARC experiments under deterministic move ordering
+
+`results/ARC_DETERMINISTIC_REPUBLISH.md`. The published verdicts survive; two specific numbers do
+not:
+
+* Classical merge-vs-tree at budget 5000: **+0.067 → +0.008** (8x smaller, CI now symmetric about
+  zero). Budgets 500 and 2000 reproduce their diffs exactly.
+* GUCT-Uniform ARC at budget 500: the borderline merge *penalty* of −0.023 at p=0.058 — the closest
+  thing to a significant merge penalty under that backup rule anywhere in this project — becomes
+  **−0.000 at p=0.87**. It does not survive.
+
+Node-reduction figures are unchanged in character (10–16% vs the published 11–13%), so the
+deduplication was always real; it was the accuracy claim at the top budget that carried hash noise.
+
+Also corrected: earlier in this thread I attributed the GUCT-ARC shift to the `is_goal` fix. Wrong
+— run side by side under deterministic ordering, old and new goal semantics are identical. The
+mover was the nondeterminism.
+
+## 3. Crossed the reject arm with GUCT-Uniform's backup rule — the fixes are NOT redundant
+
+`results/GUCT_UNIFORM_REJECT_CROSSING_FINDINGS.md`. Blocksworld, 30 puzzles, 10 repeats, both
+treatment arms at identical settings:
+
+| budget | tree | merge | reject | reject−merge | p |
+|---|---|---|---|---|---|
+| 100 | 0.033 | 0.233 | **0.323** | **+0.090** [+0.057, +0.123] | **0.0005** |
+| 300 | 0.033 | 0.603 | **0.690** | **+0.087** [+0.017, +0.160] | **0.0380** |
+| 1000 | 0.033 | 0.907 | 0.897 | −0.010 [−0.053, +0.030] | 0.8031 |
+
+Under a backup rule that by itself already removes merging's harm elsewhere, declining to pool
+*still* beats pooling at tight budgets, and ties once budget is ample. So the two fixes address
+overlapping but distinct failures: the backup rule stops pooled statistics from destroying the
+search, and the filter recovers the budget that re-deriving duplicate states wastes. Hence the gap
+is largest exactly where budget is scarcest and vanishes where it is not.
+
+Cost: the filter keeps one node per expansion (101/301/1001 vs 66.7/188.3/589.7), ~1.7x the nodes
+at matched expansion budget.
+
+**Testable prediction this generates:** the crossing should be *null* on the cube, 8-puzzle and
+Sokoban, where GUCT-Uniform already brought merge and tree to parity, leaving no gap for the filter
+to widen. If it is not null there, this explanation is wrong. Cheap to check — those are
+seconds-to-minutes domains.
+
+**And I made the same bug twice**, in two modules, independently: closing/marking a node that
+"produced nothing new" as though it "leads nowhere", which silently deletes reachable search space.
+Dropped Blocksworld's 3-block solve rate to 3/20 in the classical module and 3/10 here. Any future
+arm that can decline an expansion needs this checked explicitly.
