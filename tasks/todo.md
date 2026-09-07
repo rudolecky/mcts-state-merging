@@ -340,3 +340,62 @@ seconds-to-minutes domains.
 "produced nothing new" as though it "leads nowhere", which silently deletes reachable search space.
 Dropped Blocksworld's 3-block solve rate to 3/20 in the classical module and 3/10 here. Any future
 arm that can decline an expansion needs this checked explicitly.
+
+
+---
+
+# RETRACTION and consolidation (final)
+
+## The falsification test worked, but not the way I expected
+
+Predicted: crossing the reject arm with GUCT-Uniform's backup rule should be **null** on the cube,
+8-puzzle and Sokoban, since GUCT-Uniform already brought merge and tree to parity there.
+
+Uncharged, it looked like a decisive **refutation** — reject won by +1.000 at six of twelve cube
+budget points and +0.900 on Sokoban, while tree and merge were exactly equal everywhere. Then the
+obvious check: is reject getting extra compute?
+
+It was. **A rejected expansion never becomes an expansion, so under "budget counts expansions" it
+was free — but it costs a real `apply_move`.** Cube at td=6/budget=40: merge spends 19.6 state
+generations, reject spends 94.3. 2.4x, same nominal budget.
+
+Added `charge_rejections` to all six affected configs and re-ran everything:
+
+* **Blocksworld GUCT crossing: GONE.** Was +0.090 (p=0.0005) / +0.087 (p=0.038). Charged:
+  +0.000 / +0.008 / −0.042, all p>0.67. **The claim I committed in 97fe924 is retracted.**
+* **Falsification test: null once charged**, exactly as predicted. So the prediction was right and
+  the earlier experiment supporting the opposite was the flawed thing.
+* **Classical UCB1 Blocksworld: also does not survive.** +0.007 (p=0.58), +0.077 (p=0.31).
+* **Classical UCB1 cube: survives**, every point inside budget (44/76, 84/108, 84/166, 163/166
+  generations). merge 0.000, reject 0.983–1.000, also beating tree. This is the load-bearing
+  classical result now.
+* **LLM results unaffected** — there rejection is genuinely free, because `expand_node` draws all K
+  candidates and computes their hidden states *before* the reject decision. That asymmetry is the
+  actual reason the technique suits the reasoning search specifically, and it was not something I
+  had articulated before this audit forced it.
+
+**Corrected claim, narrower than what I argued for most of this thread:** the filter is a repair for
+pooling's catastrophic failure mode, not a general improvement on merging. Where pooling works it
+ties. Where pooling is broken it fixes it — and so does swapping the backup rule, which makes the
+two repairs **redundant, not complementary**.
+
+## Consolidated and version-controlled
+
+`results/MERGING_MECHANISM_SUMMARY.md` is now the single authoritative statement, superseding the
+individual docs where they disagree. All 34 markdown findings are tracked in git via a
+`results/*` + `!results/*.md` pattern — they were untracked because `results/` is gitignored for
+the pickles, which meant every conclusion and retraction lived only as a local file.
+
+Note on that: my first gitignore attempt used `results/` + `!results/*.md`, which silently does
+nothing because git will not descend into an excluded directory. And then my *verification* of the
+fix used `git check-ignore -v`, which exits 0 on a negation match too, so it reported the fix as
+broken when it was working. Third diagnostic failure of the session.
+
+## What I would do next
+
+1. A tau wide enough to force real false matches, on Countdown (where `reject_all` losing 5 of 19
+   is evidence they bite) rather than ProsQA (where the sweep only showed insensitivity).
+2. A second model — every LLM result here is Qwen2.5-7B with one projection.
+3. Re-audit any remaining classical merge-vs-tree finding before quoting it comparatively. The
+   accounting flaw only affects arms that decline work, so the pre-existing tree/merge results
+   should be unaffected — but after this session that should be checked, not assumed.
