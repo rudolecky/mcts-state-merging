@@ -11,4 +11,8 @@ wheels/
 
 # Experiment outputs (raw hidden-state pickles are large; regenerate via collect.py)
 results/
+# ...but the written findings are the research record, not an output. Kept in git
+# (480K of markdown across 34 files) so conclusions, retractions and corrections are
+# reviewable and cannot be lost with the directory. Force-added, hence the negation.
+!results/*.md
 .pytest_cache/
