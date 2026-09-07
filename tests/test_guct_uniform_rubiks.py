@@ -175,3 +175,41 @@ def test_run_search_solves_a_one_move_scramble_most_of_the_time():
         if is_solved(graph):
             solved_count += 1
     assert solved_count >= trials * 0.9
+
+
+# ---------- reject-duplicates arm (falsification test for the crossing) ----------
+
+def test_reject_duplicates_is_refused_alongside_merging():
+    import pytest
+    with pytest.raises(ValueError):
+        GUCTUniformConfig(merge_enabled=True, reject_duplicates=True)
+
+
+def test_reject_duplicates_keeps_states_unique_and_never_pools():
+    distances = _bfs_distances_up_to_depth(8)
+    scrambled = rc.apply_move(rc.SOLVED, rc.ALL_MOVES[0])
+    # Budget kept modest: the filter explores strictly more distinct states
+    # than pooling at matched expansions, so it walks past the depth-8
+    # distance table sooner (the table is the oracle here, not a heuristic).
+    config = GUCTUniformConfig(merge_enabled=False, reject_duplicates=True)
+    graph = run_search(scrambled, config, budget=30, rng=random.Random(0), distances=distances)
+
+    assert graph.rejected > 0  # the cube is the densest transposition domain here
+    in_degree = {}
+    for node in graph.nodes.values():
+        for edge in node.children.values():
+            in_degree[edge.child_key] = in_degree.get(edge.child_key, 0) + 1
+    assert all(d == 1 for d in in_degree.values())  # still a tree
+    states = [n.state for n in graph.nodes.values()]
+    assert len(set(states)) == len(states)
+
+
+def test_reject_duplicates_still_solves_a_one_move_scramble():
+    distances = _bfs_distances_up_to_depth(8)
+    scrambled = rc.apply_move(rc.SOLVED, rc.ALL_MOVES[0])
+    solved = 0
+    for seed in range(20):
+        config = GUCTUniformConfig(merge_enabled=False, reject_duplicates=True)
+        graph = run_search(scrambled, config, budget=20, rng=random.Random(seed), distances=distances)
+        solved += is_solved(graph)
+    assert solved >= 18

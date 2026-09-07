@@ -83,6 +83,21 @@ class GUCTUniformConfig:
     range, merge reaching 99%), so there is a real effect here for the
     filter to either reproduce or fail to."""
 
+    charge_rejections: bool = False
+    """Whether a rejected expansion counts against the budget.
+
+    It should, for any claim of the form "the filter beats pooling at
+    matched budget". A rejected move still costs a real `apply_move` --
+    the state is generated, hashed, compared and thrown away -- so with
+    this False the filter does strictly more state-generation work per
+    unit of budget than the arms it is compared against. Measured on the
+    cube at td=6/budget=40: 41 nodes plus 53 rejections, i.e. 2.4x the
+    generations merging performed at the same nominal budget.
+
+    Left False by default only so previously-recorded runs remain
+    reproducible. Every comparative claim should be read off a run with
+    this True."""
+
     def __post_init__(self):
         if self.merge_enabled and self.reject_duplicates:
             raise ValueError("reject_duplicates is only meaningful with merge_enabled=False")
@@ -275,7 +290,10 @@ def run_search(
             parent.children[path_moves[-1]].closed = True
             continue
         nodes_before = len(graph.nodes)
+        rejected_before = graph.rejected
         expanded = expand(graph, path[-1], goal, task, config, rng, heuristic)
+        if config.charge_rejections:
+            expansions_used += graph.rejected - rejected_before
         if expanded is None:
             # Reject arm: this leaf's every remaining move led somewhere
             # already reached. Retry with NO backup -- re-feeding a frozen

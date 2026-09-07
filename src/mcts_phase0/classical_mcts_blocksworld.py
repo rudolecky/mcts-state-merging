@@ -87,6 +87,18 @@ class ClassicalMCTSConfig:
 
 
 
+    charge_rejections: bool = False
+    """Whether a rejected expansion counts against the budget.
+
+    It should, for any claim of the form "the filter beats merging at
+    matched budget": a rejected move still costs a real `apply_move`, so
+    with this False the filter performs strictly more state-generation
+    work per unit of budget than the arms it is compared against. Under
+    GUCT-Uniform, charging rejections erased the filter's entire apparent
+    advantage on Blocksworld and the cube -- see
+    results/GUCT_UNIFORM_REJECT_CROSSING_FINDINGS.md. Default False only
+    so previously-recorded runs stay reproducible."""
+
     def __post_init__(self):
         if self.merge_enabled and self.reject_duplicates:
             # These two do not compose, and the way they fail to compose
@@ -279,7 +291,10 @@ def run_search(
             if _mark_exhausted(graph, path[-1], leaf, config):
                 break
             continue
+        rejected_before = graph.rejected
         expanded = expand(graph, path[-1], path_moves, goal, task, config, rng)
+        if config.charge_rejections:
+            expansions_used += graph.rejected - rejected_before
         if expanded is None:
             # reject-duplicates arm: every remaining untried move led
             # somewhere already seen. Same fallback as the cycle-block case.

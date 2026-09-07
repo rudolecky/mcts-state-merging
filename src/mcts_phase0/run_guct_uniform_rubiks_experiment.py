@@ -38,15 +38,28 @@ def _stats(rows, key_a, key_b):
     return diffs.mean(), ci, p
 
 
-def run_tier(target_distance, budgets, n_puzzles, repeats, distances, seed=0):
+def run_tier(target_distance, budgets, n_puzzles, repeats, distances, seed=0, reject=False):
+    """`reject` adds a third comparison (stage3): merge vs. the
+    reject-duplicates admission filter.
+
+    This is a falsification test, not an exploration. On Blocksworld the
+    filter beat pooling even under this backup rule, and the explanation
+    offered (results/GUCT_UNIFORM_REJECT_CROSSING_FINDINGS.md) was that the
+    backup rule stops pooled statistics destroying the search while the
+    filter separately recovers budget wasted re-deriving duplicates. That
+    predicts a NULL here: GUCT-Uniform already brought merge and tree to
+    parity on the cube, so there is no budget gap left for a filter to
+    widen. A win here would refute the explanation."""
     puzzles = rc.generate_puzzles(n=n_puzzles, seed=seed, target_distance=target_distance, distances=distances)
     tier_results = {"target_distance": target_distance, "stage1": [], "stage2": []}
+    if reject:
+        tier_results["stage3"] = []
 
     for budget in budgets:
         t0 = time.time()
-        rows1, rows2 = [], []
+        rows1, rows2, rows3 = [], [], []
         for i, inst in enumerate(puzzles):
-            tree_solved = random_solved = merge_solved = 0
+            tree_solved = random_solved = merge_solved = reject_solved = 0
             for r in range(repeats):
                 rng = random.Random(i * 100003 + r)
                 cfg_tree = GUCTUniformConfig(merge_enabled=False)
@@ -60,8 +73,16 @@ def run_tier(target_distance, budgets, n_puzzles, repeats, distances, seed=0):
                 cfg_merge = GUCTUniformConfig(merge_enabled=True)
                 g_merge = run_search(inst.start_state, cfg_merge, budget, rng3, distances)
                 merge_solved += int(is_solved(g_merge))
+
+                if reject:
+                    rng4 = random.Random(i * 100003 + r)
+                    cfg_reject = GUCTUniformConfig(merge_enabled=False, reject_duplicates=True)
+                    g_reject = run_search(inst.start_state, cfg_reject, budget, rng4, distances)
+                    reject_solved += int(is_solved(g_reject))
             rows1.append({"id": inst.id, "tree": tree_solved / repeats, "random": random_solved / repeats})
             rows2.append({"id": inst.id, "tree": tree_solved / repeats, "merge": merge_solved / repeats})
+            if reject:
+                rows3.append({"id": inst.id, "merge": merge_solved / repeats, "reject": reject_solved / repeats})
 
         tm, rm, dm1, ci1, p1 = np.mean([r["tree"] for r in rows1]), np.mean([r["random"] for r in rows1]), *_stats(rows1, "tree", "random")
         _, _, dm2, ci2, p2 = 0, 0, *_stats(rows2, "tree", "merge")
@@ -72,6 +93,13 @@ def run_tier(target_distance, budgets, n_puzzles, repeats, distances, seed=0):
               f"CI=[{ci2[0]:.3f},{ci2[1]:.3f}] p={p2:.4f} (t={elapsed:.1f}s)")
         tier_results["stage1"].append({"budget": budget, "tree": tm, "random": rm, "diff": dm1, "ci": ci1, "p": p1})
         tier_results["stage2"].append({"budget": budget, "tree": tm, "merge": mm, "diff": dm2, "ci": ci2, "p": p2})
+        if reject:
+            dm3, ci3, p3 = _stats(rows3, "merge", "reject")
+            jm = np.mean([r["reject"] for r in rows3])
+            print(f"  td={target_distance} budget={budget}: reject={jm:.3f} "
+                  f"reject_minus_merge={dm3:.3f} CI=[{ci3[0]:.3f},{ci3[1]:.3f}] p={p3:.4f}")
+            tier_results["stage3"].append({"budget": budget, "merge": mm, "reject": jm,
+                                           "diff": dm3, "ci": ci3, "p": p3})
     return tier_results
 
 
@@ -82,6 +110,10 @@ def main():
     ap.add_argument("--n-puzzles", type=int, default=8)
     ap.add_argument("--repeats", type=int, default=30)
     ap.add_argument("--distances-path", default="results/rubiks_cube_bfs_distances.pkl")
+    ap.add_argument("--reject", action="store_true",
+                    help="also run the reject-duplicates arm (stage3) and compare it against "
+                         "merging. Falsification test for the Blocksworld crossing result -- the "
+                         "explanation there predicts a null here.")
     ap.add_argument("--output", default="results/guct_uniform_experiment_rubiks.json")
     args = ap.parse_args()
 
@@ -92,13 +124,13 @@ def main():
     all_results = []
     print("=== RUBIK'S CUBE GUCT-UNIFORM, td=6 ===")
     all_results.append(run_tier(target_distance=6, budgets=[40, 60, 70, 90],
-                                 n_puzzles=args.n_puzzles, repeats=args.repeats, distances=distances))
+                                 n_puzzles=args.n_puzzles, repeats=args.repeats, distances=distances, reject=args.reject))
     print("=== RUBIK'S CUBE GUCT-UNIFORM, td=8 ===")
     all_results.append(run_tier(target_distance=8, budgets=[50, 70, 80, 100],
-                                 n_puzzles=args.n_puzzles, repeats=args.repeats, distances=distances))
+                                 n_puzzles=args.n_puzzles, repeats=args.repeats, distances=distances, reject=args.reject))
     print("=== RUBIK'S CUBE GUCT-UNIFORM, td=10 ===")
     all_results.append(run_tier(target_distance=10, budgets=[90, 110, 130, 170],
-                                 n_puzzles=args.n_puzzles, repeats=args.repeats, distances=distances))
+                                 n_puzzles=args.n_puzzles, repeats=args.repeats, distances=distances, reject=args.reject))
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

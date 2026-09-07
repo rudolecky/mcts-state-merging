@@ -53,11 +53,48 @@ class MCTSNode:
 class MCTSGraph:
     nodes: dict[object, MCTSNode]
     root_key: object
+    seen_states: set = field(default_factory=set)
+    """Reject-duplicates arm only, where node keys are path-based, so
+    `nodes` cannot answer "has this state been seen"."""
+    rejected: int = 0
 
 
 @dataclass
 class GUCTUniformConfig:
     merge_enabled: bool
+    reject_duplicates: bool = False
+    """Third arm, only meaningful with `merge_enabled=False`: compute the
+    merge key but DISCARD an expansion landing on an already-seen state
+    rather than pooling into the existing node.
+
+    Here to falsify the explanation the Blocksworld crossing produced
+    (results/GUCT_UNIFORM_REJECT_CROSSING_FINDINGS.md). There the filter
+    still beat pooling at tight budgets even under this backup rule, and
+    the account given was: the backup rule stops pooled statistics
+    destroying the search, while the filter separately recovers the budget
+    wasted re-deriving duplicates. That account predicts the crossing is
+    **null on this domain**, because GUCT-Uniform already brought merge and
+    tree to parity here -- there is no budget gap left for a filter to
+    widen. If the filter wins here too, the account is wrong."""
+
+    charge_rejections: bool = False
+    """Whether a rejected expansion counts against the budget.
+
+    It should, for any claim of the form "the filter beats pooling at
+    matched budget". A rejected move still costs a real `apply_move` --
+    the state is generated, hashed, compared and thrown away -- so with
+    this False the filter does strictly more state-generation work per
+    unit of budget than the arms it is compared against. Measured on the
+    cube at td=6/budget=40: 41 nodes plus 53 rejections, i.e. 2.4x the
+    generations merging performed at the same nominal budget.
+
+    Left False by default only so previously-recorded runs remain
+    reproducible. Every comparative claim should be read off a run with
+    this True."""
+
+    def __post_init__(self):
+        if self.merge_enabled and self.reject_duplicates:
+            raise ValueError("reject_duplicates is only meaningful with merge_enabled=False")
 
 
 def _make_node(state: tuple[int, ...], width: int, height: int, distances: dict) -> MCTSNode:
@@ -72,10 +109,12 @@ def _make_node(state: tuple[int, ...], width: int, height: int, distances: dict)
     )
 
 
-def create_root(start_state: tuple[int, ...], width: int, height: int, merge_enabled: bool, distances: dict) -> MCTSGraph:
+def create_root(start_state: tuple[int, ...], width: int, height: int, merge_enabled: bool, distances: dict,
+                reject_duplicates: bool = False) -> MCTSGraph:
     root_key = start_state if merge_enabled else ()
     root = _make_node(start_state, width, height, distances)
-    return MCTSGraph(nodes={root_key: root}, root_key=root_key)
+    seen = {start_state} if reject_duplicates else set()
+    return MCTSGraph(nodes={root_key: root}, root_key=root_key, seen_states=seen)
 
 
 def _lcb1_uniform_score(edge: MCTSEdge, T: int) -> float:
@@ -111,17 +150,25 @@ def select(graph: MCTSGraph, config: GUCTUniformConfig) -> tuple[list[object], l
 def expand(
     graph: MCTSGraph, leaf_key: object, path_moves: list[int], width: int, height: int,
     config: GUCTUniformConfig, rng: random.Random, distances: dict,
-) -> tuple[object, int]:
+) -> tuple[object, int] | None:
     node = graph.nodes[leaf_key]
-    move = rng.choice(node.untried_moves)
-    node.untried_moves.remove(move)
-    new_state = apply_move(node.state, move)
+    while node.untried_moves:
+        move = rng.choice(node.untried_moves)
+        node.untried_moves.remove(move)
+        new_state = apply_move(node.state, move)
 
-    child_key = new_state if config.merge_enabled else tuple(path_moves) + (move,)
-    if child_key not in graph.nodes:
-        graph.nodes[child_key] = _make_node(new_state, width, height, distances)
-    node.children[move] = MCTSEdge(child_key=child_key)
-    return child_key, move
+        if config.reject_duplicates:
+            if new_state in graph.seen_states:
+                graph.rejected += 1
+                continue  # admission filter: already reached, try another move
+            graph.seen_states.add(new_state)
+
+        child_key = new_state if config.merge_enabled else tuple(path_moves) + (move,)
+        if child_key not in graph.nodes:
+            graph.nodes[child_key] = _make_node(new_state, width, height, distances)
+        node.children[move] = MCTSEdge(child_key=child_key)
+        return child_key, move
+    return None  # reject arm only: every remaining move led somewhere seen
 
 
 def backup(graph: MCTSGraph, path: list[object], path_moves: list[int], value: float) -> None:
@@ -146,7 +193,7 @@ def run_search(
     lookup, never a rollout. Same closed-edge divergence-prevention logic
     as guct_uniform_blocksworld.py/guct_uniform_rubiks.py's own
     run_search (see either docstring for the full derivation)."""
-    graph = create_root(start_state, width, height, config.merge_enabled, distances)
+    graph = create_root(start_state, width, height, config.merge_enabled, distances, config.reject_duplicates)
     expansions_used = 0
     iterations = 0
     max_iterations = 20 * budget
@@ -165,7 +212,26 @@ def run_search(
             parent = graph.nodes[path[-2]]
             parent.children[path_moves[-1]].closed = True
             continue
-        child_key, move = expand(graph, path[-1], path_moves, width, height, config, rng, distances)
+        rejected_before = graph.rejected
+        expanded = expand(graph, path[-1], path_moves, width, height, config, rng, distances)
+        if config.charge_rejections:
+            expansions_used += graph.rejected - rejected_before
+        if expanded is None:
+            # Reject arm: every remaining move from this leaf led somewhere
+            # already reached. Retry with NO backup (re-feeding a frozen
+            # sample makes LCB1-Uniform's score diverge -- see this module's
+            # own cycle-block handling), and close the edge into the leaf
+            # ONLY when it has no live child edge left. Closing it
+            # unconditionally would prune the leaf's unexplored subtree:
+            # "produced nothing new" is not "leads nowhere".
+            leaf_node = graph.nodes[path[-1]]
+            if any(not e.closed for e in leaf_node.children.values()):
+                continue
+            if len(path) > 1:
+                graph.nodes[path[-2]].children[path_moves[-1]].closed = True
+                continue
+            break
+        child_key, move = expanded
         expansions_used += 1
         path.append(child_key)
         path_moves.append(move)

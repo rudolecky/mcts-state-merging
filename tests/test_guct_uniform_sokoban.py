@@ -124,3 +124,28 @@ def test_run_search_solves_a_two_push_puzzle_reliably():
         if is_solved(graph):
             solved_count += 1
     assert solved_count >= trials * 0.9
+
+
+# ---------- reject-duplicates arm (falsification test for the crossing) ----------
+
+def test_reject_duplicates_is_refused_alongside_merging():
+    import pytest
+    with pytest.raises(ValueError):
+        GUCTUniformConfig(merge_enabled=True, reject_duplicates=True)
+
+
+def test_reject_duplicates_keeps_states_unique_and_still_solves():
+    state = make_state(52, (53,))  # 2 pushes needed
+    solved = 0
+    for seed in range(20):
+        config = GUCTUniformConfig(merge_enabled=False, reject_duplicates=True)
+        graph = run_search(state, config, budget=30, rng=random.Random(seed), distances=_DISTANCES)
+        solved += is_solved(graph)
+        in_degree = {}
+        for node in graph.nodes.values():
+            for edge in node.children.values():
+                in_degree[edge.child_key] = in_degree.get(edge.child_key, 0) + 1
+        assert all(d == 1 for d in in_degree.values())  # still a tree, never pooled
+        states = [n.state for n in graph.nodes.values()]
+        assert len(set(states)) == len(states)
+    assert solved >= 18

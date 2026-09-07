@@ -81,6 +81,22 @@ deduplication at all, only in what the backup rule does with pooled statistics, 
 pool is a third option that neither of the earlier capping mitigations approximated. The cost is
 wall clock: a rejected move still pays for the state it computed and threw away.
 
+That last sentence turned out to matter more than it first appeared. Because budget counts
+expansions and a rejected move never becomes one, reject mode was quietly performing roughly twice
+the state generations of the arm it was compared against. Charging rejections against the budget
+removes reject mode's advantage on Blocksworld entirely, and removes it under the GUCT Uniform
+backup rule on every domain. What survives is narrower and clearer: reject mode is a repair for the
+case where pooling fails catastrophically, not a general improvement on merging. On the Rubik's
+Cube under UCB1 with Monte Carlo average backup, where merging solves nothing at all, reject mode
+still solves everything within a charged budget. Everywhere pooling already works, reject mode
+merely matches it. Swapping the backup rule fixes the same failure, so the two repairs are
+alternatives rather than additions.
+
+The LLM guided harness is the exception, and for a concrete reason: there the candidate
+continuations are all generated in one batch before any reject decision is made, so declining one
+costs nothing extra. That is why the technique is attractive for the reasoning search specifically
+rather than as a general search improvement.
+
 ## Repository layout
 
 * `src/mcts_phase0/`: all search algorithms and domain engines.
