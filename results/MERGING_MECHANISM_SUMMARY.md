@@ -16,11 +16,9 @@ Every result in this repo before this work measured the bundle. Separating them:
 carries the benefit. Where pooling works, how you cash the deduplication in does not matter —
 filtering and pooling tie. Where pooling is broken, filtering is the repair.**
 
-Both halves of that were narrowed by this project's own tests: the first by an accounting audit
-(§4), the second by a second model (§2).
-
-That is narrower than the version first written up here, and the narrowing came from an accounting
-error I made and then caught (§4).
+Both halves of that were narrowed by this project's own tests, and neither narrowing came from
+outside: the first from an accounting audit (§4), the second from a second model (§2). The version
+first written up here was broader than the evidence supported.
 
 ## 1. Classical domains, exact equivalence
 
@@ -90,10 +88,10 @@ It also killed a prediction of mine: the 1.5B's projection is materially worse (
 estimate while costing the filter one candidate. Pooling did marginally better. Training-set
 false-merge rate does not predict which mechanism wins.
 
-Phase 1's gate is met on both datasets. Pooling fails to add anything, and on Countdown does not
-even clear the baseline significantly while the filter does. Caveat: the `reject` − `treatment`
-p-values (0.063–0.070) are the floor McNemar's exact test can return for those one-sided
-discordances, so n is the constraint.
+Phase 1's gate is met on both 7B datasets and the core effect replicates on a second model. What
+does *not* survive is any ordering between the two mechanisms. The one setting where the filter
+clearly won (7B Countdown, where pooling did not even clear the baseline significantly) is now a
+single data point against two ties, not the general pattern.
 
 **Answer-exemption is load-bearing, not a detail.** Filtering verifiable terminals too costs −0.150
 pooled and 5 of 19 problems on Countdown, where `reject_all` lands *below* pooling. An answer can be
