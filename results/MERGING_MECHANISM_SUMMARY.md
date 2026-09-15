@@ -13,8 +13,11 @@ Merging bundles two operations:
 Every result in this repo before this work measured the bundle. Separating them:
 
 **Pooling is where the risk lives, and it is the half that can fail catastrophically. Deduplication
-carries the benefit — but only where pooling is broken. Where pooling works, deduplicating without
-it merely ties.**
+carries the benefit. Where pooling works, how you cash the deduplication in does not matter —
+filtering and pooling tie. Where pooling is broken, filtering is the repair.**
+
+Both halves of that were narrowed by this project's own tests: the first by an accounting audit
+(§4), the second by a second model (§2).
 
 That is narrower than the version first written up here, and the narrowing came from an accounting
 error I made and then caught (§4).
@@ -70,8 +73,22 @@ dominant cost.
 |---|---|---|---|
 | `reject` − `baseline` | +0.667, p=0.0001 | +0.579, p=0.0074 | **+0.625, p<0.0001** |
 | `treatment` − `baseline` | +0.619, p=0.0002 | +0.316, p=0.18 (n.s.) | +0.475, p=0.0003 |
-| `reject` − `treatment` | +0.048 (1 vs 2) | +0.263 (0 vs 5) | **+0.150, CI [+0.025, +0.275]** |
+| `reject` − `treatment` | +0.048 (1 vs 2) | +0.263 (0 vs 5) | +0.150, CI [+0.025, +0.275] |
 | `reject_all` − `reject` | −0.048 | −0.263 | −0.150, CI [−0.275, −0.025] |
+
+**A second model withdraws the `reject` − `treatment` line above.** Qwen2.5-1.5B on ProsQA (n=42,
+`SECOND_MODEL_FINDINGS.md`): the filter still beats the baseline significantly (+0.214, p=0.0225),
+so H3 replicates — but `reject` − `treatment` is −0.024 (5 vs 4 discordant), a tie. Across all
+three settings the filter clearly beats pooling in **one** (7B Countdown, +0.263) and ties in the
+other two. Pooled across models: +0.061, CI [−0.037, +0.159], p=0.33.
+
+So the honest H3′ statement is symmetric: **pooling adds nothing over filtering, and filtering adds
+nothing over pooling.** "Filtering beats pooling" is withdrawn to a single-setting result.
+
+It also killed a prediction of mine: the 1.5B's projection is materially worse (false-merge rate
+0.24 vs 0.113), and I expected that to hurt *pooling* most, since a false match corrupts a pooled
+estimate while costing the filter one candidate. Pooling did marginally better. Training-set
+false-merge rate does not predict which mechanism wins.
 
 Phase 1's gate is met on both datasets. Pooling fails to add anything, and on Countdown does not
 even clear the baseline significantly while the filter does. Caveat: the `reject` − `treatment`
@@ -131,8 +148,9 @@ introduce.
 1. **A τ wide enough to force real false matches**, on Countdown — where `reject_all` losing 5 of 19
    problems is direct evidence false matches bite, unlike ProsQA where the sweep only showed
    insensitivity.
-2. **A second model.** Every LLM result here is Qwen2.5-7B with one projection. That is the largest
-   unaddressed threat to §2: is this about search, or about that projection?
+2. ~~**A second model.**~~ **Done** (`SECOND_MODEL_FINDINGS.md`). H3 replicates on Qwen2.5-1.5B
+   (+0.214, p=0.0225); "filtering beats pooling" does not. A third model would tell you whether
+   Countdown-under-7B was the outlier or the two ties were.
 3. **Re-audit the remaining classical merge-vs-tree findings for the accounting flaw** if any of
    them are ever quoted comparatively. The flaw only affects arms that decline work, so the
    pre-existing tree/merge results are unaffected — but that should be checked, not assumed, given
