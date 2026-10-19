@@ -79,3 +79,28 @@ What changes is which specific numbers can be quoted:
 The classical Blocksworld, Sokoban, 8-puzzle, cube and Connect Four results are untouched — their
 `legal_moves` are list comprehensions over ordered structures, verified, with no set iteration
 anywhere.
+
+## Addendum, 2026-10-02: the GUCT-Uniform numbers above carried an early-termination bug
+
+`guct_uniform_arc.py`'s `run_search` ended the search when every remaining untried move at the
+root failed to execute — even though the root still had live children — and, below the root,
+closed the incoming edge unconditionally, pruning the leaf's existing subtree. An audit measured it
+stopping 23/120 tree and 16/120 merge runs after ~15–24 nodes at budget 500. Fixed by closing (or,
+at the root, stopping) only when no live child edge is left, which is the fix the other GUCT ports
+already had; a regression test fails on the old code (the search stopped after 1 of 20 expansions).
+
+Re-run with the published arguments (30 tasks, seed 0, 10 repeats, moves-per-node 40). The run was
+killed at task 28/30 of budget 2000 because it was thrashing swap alongside a 7B LLM job; the
+per-task counts below are recovered from its log, compared task by task with the deterministic run
+above:
+
+| budget | tasks | | tree | merge | merge − tree | p (Wilcoxon) |
+|---|---|---|---|---|---|---|
+| 500 | 30/30 | deterministic (bug) | 0.120 | 0.120 | −0.000 | 0.87 |
+| | | **fixed** | 0.133 | 0.130 | **−0.003** | 0.58 |
+| 2000 | 27/30 | deterministic (bug) | 0.159 | 0.178 | +0.019 | 0.36 |
+| | | **fixed** | 0.200 | 0.167 | **−0.033** | 0.26 |
+
+The fix raises both arms slightly (tree +0.013 / +0.041, merge +0.010 / −0.011; none significant)
+and **the GUCT-Uniform ARC null survives**: merge − tree is null at both budgets. Raw log:
+`results/guct_uniform_arc_experiment_earlystop_fixed.partial.log`.

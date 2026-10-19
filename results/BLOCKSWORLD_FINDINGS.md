@@ -89,6 +89,12 @@ separate, isomorphic subtree, the untreated tree can exhaust its own expandable 
 spending its full budget. Treatment never shows this -- merged nodes always have somewhere
 genuinely new to explore.
 
+> **Corrected 2026-09-24.** That explanation is wrong. In a path-keyed tree a child is never on the
+> current path, so `select()` always reaches an untried move or a terminal. The shortfall comes from
+> solved baseline runs: `run_search` has no solve-based exit, so a solved run spins on the goal until
+> the 20× iteration cap without spending budget. The same pattern was measured on the cube (solved
+> tree runs spent 96.6/100, 189/200 and 369/400). See `MERGING_MECHANISM_SUMMARY.md` §4.
+
 ## Mechanism
 
 This matches the 8-puzzle's and Sokoban's pattern, not Connect Four's or Morris's, exactly as

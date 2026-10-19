@@ -24,8 +24,7 @@ So: does filtering actually pay, and does pooling add anything on top of it?
 The published H3 configuration exactly (`H3_MERGE_SEARCH_FINDINGS.md`): ProsQA,
 Qwen2.5-7B-Instruct on MPS, frozen Ridge projection at layer `mid`, τ=0.01, K=4, budget 15,
 c_puct=1.5, temperature 0.8, 21 in-band held-out problems (seed 90), verified against ground
-truth. Four arms, all seeded per `(held_out_seed, problem_id, arm)` so they are paired on
-identical LM draws:
+truth. Four arms, all seeded per `(held_out_seed, problem_id, arm)`, paired by problem (each arm draws its own LM samples — the per-arm seed includes the arm's name; corrected 2026-10-02):
 
 | arm | equivalence relation | on a match | tree shape |
 |---|---|---|---|

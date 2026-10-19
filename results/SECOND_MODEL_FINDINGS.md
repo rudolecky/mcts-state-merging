@@ -13,7 +13,7 @@ Designed to be decisive either way. It was — in opposite directions for the tw
 Qwen2.5-1.5B-Instruct, ProsQA, projection fit on the Phase 0 pilot snapshots for that model
 (`results/raw_pilot/snapshots_seed0.pkl`, 107 ProsQA records from 14 problems, layer `mid`,
 α=100). Same search settings as the 7B run: τ=0.01, K=4, budget 15, c_puct 1.5, temperature 0.8,
-40 new tokens/step, chain length 3–5, seed 90, three arms paired on identical LM draws. 42 held-out
+40 new tokens/step, chain length 3–5, seed 90, three arms paired by problem (each arm draws its own LM samples — the per-arm seed includes the arm's name; corrected 2026-10-02). 42 held-out
 problems, 84 minutes.
 
 Two deliberate differences, both noted rather than hidden:

@@ -174,11 +174,34 @@ Redesigns `latent-mcts-merging-plan.md` Phase 1 around an admission filter, and 
       barely move (338/340/331), because ProsQA's distances are crisply separated. tau=0.1 was
       not reached (stopped); its 3 shards remain in the checkpoint.
 
-- [ ] **Top open item: a tau wide enough to force real false matches, on a domain where
-      distances spread.** Countdown is the candidate — its `reject_all` result is direct evidence
-      that false matches there cost real problems. Then a third dataset (both current ones are
-      small and single-model), and more n to move the `reject` − `treatment` p-values, which sit
-      at the floor McNemar can return for their one-sided discordances.
+- [x] **Wide tau on Countdown.** Six points (published tau to 60x it, picked from the measured
+      LOPO calibration table). Result: **the cube's "filter falls below baseline" does not
+      reproduce** -- floors at 4/10 vs a 2/10 baseline even 60x past published tau. But
+      `reject - treatment` flips sign past tau~0.36 (favouring pooling), never significant on this
+      n=10 slice. And tau=1.11/2.0 are byte-identical -- the (depth,kind) bucket saturated, so the
+      run could not distinguish "the filter is robust" from "this projection cannot be made bad
+      enough to test it here", which is exactly the risk flagged before running it. Write-up:
+      `results/COUNTDOWN_WIDE_TAU_FINDINGS.md`. Not committed.
+
+- [x] **Is Countdown's null about scale?** Budgeted the cube down to match Countdown's own baseline
+      solve rate (td=3/budget=28 -> tree=0.167, next to Countdown's 0.20) rather than matching raw
+      budget numbers (not comparable -- cube's ~18-move branching vs Countdown's K=4). **No** --
+      the collapse reproduces easily: pooling near-zero throughout, filter significantly below tree
+      at tau=4 (-0.125, CI excludes zero, p=0.047). So the mechanism does not need the cube's larger
+      budgets to show up; Countdown's null is a property of that domain/projection, not of scale.
+      Folded into both write-ups.
+
+- [x] **Sign-flip extension, seeds 71/72 at tau in {0.17, 0.36}, n=19.** Hit a checkpoint-
+      fingerprint pitfall first: sharing one --output-dir across different held_out_seed values is
+      refused (the directory fingerprint includes held_out_seed/n_low/n_high/calibrated_from, not
+      just tau), so seed 72 needed its own dir. Fixed, re-ran. **Result: the flip does not survive
+      more power.** At n=19: tau=0.17 filter significantly beats baseline (+0.421, p=0.0215, CI
+      excludes zero) with filter-vs-pool still mildly favouring filter (+0.105, n.s.); tau=0.36
+      filter and pool tie EXACTLY (11/19 each, delta 0.000) rather than pool pulling ahead as the
+      n=10 slice suggested. So the apparent sign flip toward pooling was noise from 9 extra
+      problems, not a real trend -- the filter's edge over pooling holds or ties throughout, and
+      its edge over baseline strengthens to significant at 5x the published tau. Folded into
+      `COUNTDOWN_WIDE_TAU_FINDINGS.md` and the authoritative summary.
 
 ## Review outcomes (second review agent)
 
@@ -399,3 +422,224 @@ broken when it was working. Third diagnostic failure of the session.
 3. Re-audit any remaining classical merge-vs-tree finding before quoting it comparatively. The
    accounting flaw only affects arms that decline work, so the pre-existing tree/merge results
    should be unaffected — but after this session that should be checked, not assumed.
+
+---
+
+# The empty cell: pooling broken AND the relation approximate
+
+Every catastrophic-pooling result here used **exact** state identity (the cube under UCB1 +
+MC-average). Every **approximate** relation (learned projection + tau) sat in a domain where
+pooling worked. So the cell that decides whether the filter's repair depends on the relation being
+exact has never been filled — and it is the cell the latent programme lives in, since a learned
+relation is always approximate.
+
+**Question.** On a domain where pooling is catastrophic, does the filter still repair it when the
+equivalence relation is approximate, and how does that degrade as the relation gets worse?
+
+**Design.** Rubik's cube, UCB1 + MC-average backup (pooling = 0.000 with an exact key). Replace
+exact state identity with a relation built to mirror the LLM harness's: two states match if they
+sit at the **same depth** and their **oracle distance-to-goal differs by less than tau**. That is
+the same shape as `search.py`'s `find_merge_target` (same (depth, kind) bucket, |Δ 1-D value| < tau),
+so the cube becomes a controlled stand-in for the learned-relation setting with ground truth
+available.
+
+Ground truth is the point: two states matched under this relation are usually *not* the same state,
+so the **false-merge rate is directly measurable** rather than estimated from held-out data.
+
+## Plan
+
+1. [x] Approximate keying in `classical_mcts_rubiks.py`: `key_tau` (None = exact, unchanged),
+       depth-bucketed index, match helper, wired into both the merge and reject arms.
+       → verify: exact mode byte-identical to before on fixed seeds.
+2. [x] Instrument `false_matches` / `total_matches` so each run reports its own measured
+       false-merge rate. → verify: unit test with a hand-built case.
+3. [x] Unit tests: approximate match fires; false matches counted; reject arm still a tree; exact
+       mode a no-op. → verify: suite green.
+4. [x] Sweep tau across three arms with rejections charged. → verify: tau=0 reproduces the
+       published exact-key numbers.
+5. [x] Findings doc + auto-review agent.
+
+**Prediction, written before running.** Pooling stays at 0.000 throughout — it is already broken
+with a perfect relation and a worse relation cannot help it. The filter degrades *gracefully*:
+a false match costs it one discarded branch, so its solve rate should fall smoothly with the
+false-merge rate rather than collapsing. If instead the filter collapses as soon as the relation
+is approximate, the repair depends on exactness and the whole latent programme inherits that
+limitation — which would be the most consequential negative in this project.
+
+**Do not commit** without an explicit ask (memory rule).
+
+
+## Result: the prediction held — but only after the first version was thrown out
+
+**Pre-registered:** pooling stays at 0.000; the filter degrades *gracefully*, because a false match
+costs it one discarded branch.
+
+**First run said the opposite** — a cliff, 1.000 at τ≤1.5 and 0.000 at τ≥3 — and I wrote that up as
+the prediction being falsified. The auto-review found the design confounded three ways:
+
+1. **τ was a three-position dial, not a continuum.** Oracle distance changes by ±1 per move, so
+   within a depth bucket every gap is even; τ ∈ {0.5, 1.5} selected identical match sets, as did
+   {3, 6} (match counts 80, 80, 187, 187). Worse, the first band was *transitive* — exact identity
+   on a coarsened space, i.e. not an approximate relation at all.
+2. **The goal state was being swallowed** (34–44 events at τ=3), while `search.py` spares terminals
+   by default. The arm was doing something the module it stood in for explicitly does not.
+3. **Exact merging was still live underneath**, across depth buckets, so the measured relation was
+   not the only relation in force and `false_matches` undercounted it.
+
+Fixed by adding continuous per-state noise (SHA-256, not `hash()`, which is per-process random),
+sparing the goal by default (`reject_goal`), and creating nodes directly in the `key_tau` branch so
+nothing merges by exact identity underneath. Re-ran everything.
+
+**Corrected result: graceful degradation, as predicted.** 8 puzzles × 15 repeats, arms paired on
+identical seeds, rejections charged, noise ±1.0.
+
+| τ | false-merge | td6/100 | td8/200 | td10/400 | tree baseline |
+|---|---|---|---|---|---|
+| exact | — | 1.000 | 1.000 | 1.000 | 0.533 / 0.400 / 0.367 |
+| 0.25 | 0.50–0.57 | 0.908 | 0.958 | 0.983 | ″ |
+| 0.5 | 0.66–0.72 | 0.875 | 0.942 | 0.883 | ″ |
+| 1.0 | 0.78–0.80 | 0.642 | 0.850 | 0.875 | ″ |
+| 2.0 | 0.86 | 0.142 | 0.242 | 0.275 | ″ |
+| 4.0 | 0.909 | 0.000 | 0.000 | 0.000 | ″ |
+
+Pooling is **0.000 in all 18 cells**. `filter − pool` is significant throughout: p=0.0078 at
+τ ≤ 1, and at τ=2 p=0.0312 (td6, td8) / 0.0078 (td10). With n=8 paired puzzles 0.0078 is the
+Wilcoxon floor (2/2⁸) — it means all 8 puzzles favour the filter, not a precise level.
+
+Three things fall out, and two of them retract lines from the first write-up:
+
+1. **The repair does not need an exact relation.** At a measured false-merge rate of 0.5 the filter
+   still solves 0.91–0.98; at 0.78 it is 0.64–0.88, above the tree baseline on all three tiers.
+   That is the answer the latent programme needed — the mechanism is not an artifact of exactness.
+2. **But the filter can fall below doing nothing.** Above tree on all three tiers at τ=1, below on
+   all three at τ=2, so the crossing is bracketed to 1 < τ* < 2 and not located; by τ=4 it is
+   0.000 against a tree baseline of 0.367–0.533. (`filter − tree` is not significance-tested —
+   the sweep only tests `filter − pool` — so this is secure at τ=4 and suggestive at τ=2.) Pooling was already on the floor and
+   could not fall; the filter could. "A wrong rejection costs one discarded branch and does not
+   accumulate" is **false past a threshold** — when the rejected branch is on the solution path, the
+   cost is the solution.
+3. **False-merge rate does predict it, monotonically** — within each tier both series move together
+   across all 18 cells (pooled across tiers they do not, since the tiers have different baselines).
+   **Retracted:** the first write-up's claim that it does not was an artifact of the 3-position dial.
+   The second-model result it was paired with (a worse projection produced *better* pooling) stands
+   on its own and is untouched by this.
+
+**Verification.** `key_tau=None` is a strict no-op: **3240 paired runs across 108 configurations**
+(extended after review to cover `value_source="oracle"`, which the original grid omitted despite it
+being the setting every arm uses), zero mismatches on full graph signatures, and exact mode
+reproduces the published cube node counts (44/76, 84/108, 163/166) to the digit.
+
+**The recurring lesson, in a new costume:** a discrete-valued key makes a threshold sweep look like
+a sweep when it is sampling two points. The grid {0.5, 1.5, 3, 6} looked like four conditions and
+was two — and the collapse I read as a mechanism was the boundary between them.
+
+Write-up: `results/APPROXIMATE_RELATION_FINDINGS.md`. Not committed — no ask this turn.
+
+## Post-write-up review: my own compute correction was half wrong
+
+The verification agent confirmed the 44 → 100 correction (a pooled expansion creates no node;
+`new_nodes+merge_hits+rejected` equalled the monkeypatched real `apply_move` count in 80/80 runs;
+the derived td10/b200 row is now directly measured). But it killed the interpretation I attached:
+
+* **"The filter is the cheaper arm" is false** — an artifact of `run_search` having **no
+  solve-based exit**. A terminal leaf is backed up and `continue`d before `_mark_exhausted`, so a
+  solved run spins on the goal expanding nothing until `max_iterations = 20 × budget`. The filter
+  stops spending once it wins; pooling, which never wins, spends to the last unit. Split by
+  outcome the ranking inverts (td6/τ=1: 77.3 solved vs **103.9 failed**, above pooling's 100), and
+  under GUCT-Uniform at td6/b40 the charged filter costs 40.6 against merge's 40.0.
+* **My stated mechanism was wrong too** — "merge scores 0.000 so it never exits early". No arm
+  exits early on a solve. Right conclusion, wrong reason.
+* The surviving claim is the one that matters: **the filter never exceeds pooling's budget in the
+  runs it wins**, which is exactly what `charge_rejections` must guarantee.
+
+Also corrected, verified independently: the GUCT doc claimed merge "does not even spend its budget
+(20 generations against 40) — the more compute-efficient arm". Counting `apply_move` directly,
+merge spends **exactly** its budget in all six rows and the charged filter marginally more. And the
+same mislabelled cube table was still published uncorrected two tables further down in that file,
+plus in `PAPER_DRAFT.md` §7.1 — the section whose subject is this exact error.
+
+Remaining known gaps, not fixed: `filter − tree` is never significance-tested; the crossing is
+bracketed by a 5-point grid, not located.
+
+---
+
+# Round after the brief: four questions, and a correction
+
+- [x] **Countdown correction.** `apply_projection` clips to [0,1], so τ >= 1 is the coarsest relation
+      the bucketing allows. Saved tau=2.0 graphs: exactly one step node per depth in 10/10 problems --
+      the filter became a single chain and still solved 4/10 vs baseline 2/10. "Could not be made bad
+      enough" was wrong; it was made as bad as possible. Calibration cutoffs >1 come from unclipped OOF
+      predictions.
+- [x] **Proposal quality (cube, td8/b200).** New `expand_noise` option (None = random order, default
+      unchanged: 3240/3240 no-op). Saturated-relation filter: 0.000 random -> 0.150 sd2 -> 0.975 sd1 ->
+      1.000 sd<=0.5. Pooling (exact): 0.000 -> 0.283 -> 0.917 -> 1.000. **Both catastrophes need random
+      proposals.** Tree unexpectedly degrades with better proposals (0.400 -> 0.000; shallower, more
+      duplicates/undo moves) -- unexplained, variant-specific; filter-tree not meaningful there.
+      Write-up: `results/PROPOSAL_QUALITY_FINDINGS.md`; folded into summary, cube, Countdown, paper docs.
+- [ ] **Random-rejection control (LLM).** Single chain with no real dedup beat baseline 4/10 vs 2/10,
+      so part of the filter's Countdown gain may be forced depth. Matched-rate random rejection would
+      separate them. Not run. Note: changing search.py invalidates every checkpoint (fingerprint hashes
+      it), so the baseline must be recomputed.
+- [x] **Third model: Qwen2.5-1.5B on Countdown-3 (n=40).** 3B (3/60 in-band) and Math-7B (0/30,
+      format) unusable. Raw: baseline 15, pool 10, filter 11 -- looked like deduplication hurts.
+      Cause: a **second budget leak** -- a search whose every reachable leaf is a terminal answer spins
+      to the iteration cap with budget unspent; 26/23 of 40 dedup runs stopped short and unsolved.
+      Also present in the published 7B runs. **Compute-matched re-analysis** (baseline truncated to the
+      arm's actual expansions; exact because PUCT has no budget-dependent schedule; validated 59/59):
+      every published H3 gain gets stronger (7B Countdown pooling +0.316 n.s. -> +0.579 p=0.001);
+      third model turns slightly positive (n.s.). Filter-vs-pool: another tie (+0.025) and confounded
+      by pooling leaking more. Write-up: `results/THIRD_MODEL_BUDGET_LEAK_FINDINGS.md`.
+- [ ] **Fix the LLM-harness leak** (design choice: widen on starvation / stop on verified answer /
+      force expansion), then re-run filter-vs-pool. Every LLM number changes.
+- [x] **Re-audit of classical merge-vs-tree compute claims.** Per charged expansion tree and merge do
+      identical work in all 13 modules; no tree-vs-merge solve rate changes. But merge's node count
+      undercounts its generations 1.1-2.4x, and ~15 older docs read node counts as compute. Fixed:
+      consolidated erratum in the summary's section 4; inline corrections where a mechanism was wrong
+      (BLOCKSWORLD "tree running out of room", H3 "compressed into a quarter" mixing early stopping);
+      errata banner on ARTICLE_DERIVED; GUCT crossing Blocksworld column relabelled as node counts
+      (arms are compute-matched); ARC row marked uncharged in summary and paper.
+      **Reproduction gap closed:** no runner passed charge_rejections, so the paper's commands
+      reproduced uncharged numbers. Added --charge-rejections to the five runners (default off; the
+      Blocksworld runners write a separate _charged file); smoke-tested.
+      **Footgun fixed:** key_tau on a tree arm pooled silently; now refused, test added.
+      **Not fixed:** guct_uniform_arc.py breaks early when the root's last untried moves fail to
+      execute (stopped 23/120 tree and 16/120 merge runs at budget 500) -- fixing it changes published
+      GUCT-ARC numbers and needs a re-run.
+
+---
+
+# Testing "What would change the conclusion" (2026-10-02)
+
+Scratchpad was wiped between sessions (it lives in /tmp): all scratch run shards and the brief's local
+HTML are gone; every number survives in results/*.md. New runs write under results/.
+
+## Plan
+- [x] **Leak fix in search.py** (opt-in, default off): `widen_on_starvation` re-samples at the selected
+      node, charged, ONLY when no unexpanded step node exists (structural starvation explained 41/41
+      short unsolved published runs, incl. 5/42 baseline runs on 1.5B ProsQA). `stop_on_solve` ends a
+      solved search (cannot change solved). Runner flags + `widenings` recorded (row schema 2).
+- [x] **Random-rejection control**: `random_reject` arm drops step candidates (answers exempt) with a
+      hashed, deterministic draw at `--random-reject-rate`, set to the filter's *realized* rate in the
+      same leak-fixed run. Separates deduplication from forced depth.
+- [x] Tests: 8 new; 5 mutants each caught (frontier guard, fake re-sample, answer exemption,
+      exhausted-marking guard, stop_on_solve). 542 pass. Real-model smoke test: every arm spends full budget.
+- [x] **1.5B settings re-run with the fix** (`results/LEAK_FIX_RERUN_FINDINGS.md`). Validation held:
+      ProsQA baseline and filter identical to published on 42/42; only pool changed (+4, 0 lost).
+      Pool − baseline +0.333 (p=0.0013) on ProsQA; Countdown-3 unchanged, arms trail baseline (n.s.).
+      Random rejection at the filter's rate: +0.119 / −0.225 (p=0.004); filter beats it 11 vs 2
+      (p=0.022) -> the relation deduplicates. Truncation compute-matching retracted as a substitute.
+- [x] **7B settings done** (Docker quit; detached runs + vitest throttle). Both unchanged problem for
+      problem; filter vs random 20 vs 3 across four settings (p=0.0005). Was: **7B settings blocked by memory**: float32 7B needs ~28 GB; local fana-train MLX servers hold
+      ~33 GB of 64. First attempt thrashed 75 min, stopped. Ready: `results/leakfix/driver.sh cd7b prosqa7b`.
+- [x] **Ops lessons**: scratchpad is /tmp (wiped between sessions) -> runs now write to results/;
+      a 9.5 GB CPU job beside a 7B model caused the thrash; `grep -v` without --line-buffered hid driver
+      progress; killing a driver's child just advances the driver.
+- [x] **GUCT-ARC early stop** fixed (mirrors the other GUCT ports); regression test fails on old code
+      (1 of 20 expansions) and passes now. Re-running the deterministic 30-task experiment.
+- [x] **Correction:** LLM arms are NOT paired on identical LM draws (arm name is in the seed; root
+      expansions differ in 10/10 published problems). Paired by problem only -- McNemar still valid,
+      comparisons just noisier than claimed. Fixed in 6 docs + the runner comment.
+- [x] **Review of the leak fix found 3 gaps** (iteration-cap leak with a frontier present: 4 runs;
+      widen target at max_depth; random_reject without widening could end at root). Fixed + 5 tests,
+      6 mutants caught, 547 pass. Both 1.5B settings re-run in full (`results/leakfix2/`): **328/328
+      outcomes identical** to the first version; unsolved runs with budget unspent 4 -> 0.

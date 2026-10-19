@@ -33,6 +33,11 @@ straddles zero. Whatever nominal +2.5pp edge treatment shows is noise at this n.
 | baseline | 39.2 | 17.0s |
 | treatment | **9.5** | 12.0s |
 
+> **Corrected 2026-09-24.** The next sentence mixes deduplication with early stopping: in
+> `search_results_seed99.pkl` treatment executed 6.6 of 10 expansions on average (range 2–10) against
+> the baseline's 10, because a solved search stops. Part of the 39.2 → 9.5 node gap is fewer
+> expansions, not compression. Every candidate still gets its forward pass before the merge check.
+
 Treatment consistently lands near 40 candidate-draws worth of raw exploration compressed into
 roughly a quarter as many distinct nodes, across nearly every problem (spot-checked range: 3-20
 nodes vs. baseline's consistent 35-40) — the deduplication mechanism is working exactly as

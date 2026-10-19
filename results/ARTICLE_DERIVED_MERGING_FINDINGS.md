@@ -1,5 +1,22 @@
 # Article-Derived Merging Improvements: One Defect, One Strong Positive, One Clean Negative
 
+> **Errata, 2026-09-24** (budget-accounting audit; details in `MERGING_MECHANISM_SUMMARY.md` §4).
+> Every reject-arm number in this document is **uncharged** unless stated. Specifically:
+> - "~1.7× the state generations if you do not charge them": a node ratio. Measured `apply_move`
+>   ratios for uncharged reject are 1.4–1.6× on 5-block Blocksworld.
+> - "solves 100% at every budget and difficulty" on the cube: charged, td10/b200 is 0.983; td6/b50
+>   and td8/b100 were never re-run charged.
+> - "The admission filter beats merging on merging's best domain" (Blocksworld): retracted — it
+>   does not survive charging.
+> - "Merging's 12–16% node reduction … computing it costs about what the saved expansion did":
+>   wrong mechanism. A pooled expansion saves no expansion, generation or rollout (ARC: merge 721 vs
+>   tree 729 generations, rollouts −1%); only the node is saved.
+> - "The reject arm's cost … up to +37%": the table shows −10% to +37% wall-clock, uncharged.
+> - "On the cube it goes the other way": reject stops expanding once solved (no solve-based exit),
+>   which is not evidence it is cheaper.
+> - "+30% on ARC at budget 5000 … node count barely below the tree's": contradicts this document's
+>   own table (wall-clock −10% / +37%, nodes +4% / −5%).
+
 ## Question
 
 An ARC-AGI/MCTS landscape review was read for transferable ideas about *merging* specifically.
@@ -107,6 +124,13 @@ generations if you do not charge them.
 
 **The cube result below does survive**, and is now the load-bearing classical claim. Re-verified
 with charging, oracle-guided, c=0.02, 8 puzzles, 15 repeats:
+
+> **Accounting note (2026-09-21).** In the "generations merge/reject" column below, the merge side
+> is a *node* count and the reject side is `nodes + rejections`; neither is an `apply_move` count.
+> A pooled expansion creates no node, so merge's compute is understated — by 2.27–2.45× on the cube
+> rows, magnitude unmeasured on the Blocksworld rows, where the reject column being exactly
+> budget+1 suggests the two arms are compute-matched rather than the filter being costlier. See
+> `MERGING_MECHANISM_SUMMARY.md`.
 
 | tier/budget | tree | merge | reject (charged) | generations merge/reject |
 |---|---|---|---|---|

@@ -13,8 +13,7 @@ The published Countdown H3 configuration exactly
 (`search_experiment_qwen7b_countdown4`): Qwen2.5-7B-Instruct on MPS, frozen Ridge projection at
 layer `final`, τ=0.0334, K=4, budget 15, c_puct=1.5, temperature 0.8, max 60 new tokens per step,
 4 numbers drawn 1–10, seed 70, 10 in-band held-out problems, verified against ground truth. Same
-four arms as ProsQA, each seeded per `(held_out_seed, problem_id, arm)` so they are paired on
-identical LM draws. 78 minutes.
+four arms as ProsQA, each seeded per `(held_out_seed, problem_id, arm)`, paired by problem (each arm draws its own LM samples — the per-arm seed includes the arm's name; corrected 2026-10-02). 78 minutes.
 
 **The baseline reproduces the published run exactly** (2/10 both), which is the check that this is
 the same experiment. Published pooling was 7/10 against 6/10 here — one problem, the expected size

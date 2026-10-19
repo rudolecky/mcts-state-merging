@@ -25,10 +25,17 @@ If those repair the same failure, applying the second on top of the first should
 accounting it is free — but it costs a real `apply_move`: the state is generated, hashed, compared
 and discarded. Measured on the cube at td=6, budget 40:
 
-| arm | nodes | rejections | state generations | vs budget 40 |
+| arm | nodes | rejections | real `apply_move` | vs budget 40 |
 |---|---|---|---|---|
-| merge | 19.6 | 0 | 19.6 | inside |
-| reject | 41.0 | 53.3 | **94.3** | **2.4× over** |
+| merge | 19.6 | 0 | 40.0 | at budget |
+| reject (uncharged) | 41.0 | 53.3 | **93.2** | **2.3× over** |
+
+> **Corrected 2026-09-21.** The "state generations" column originally read 19.6 for merge and 94.3
+> for reject. Neither was an `apply_move` count: 19.6 is merge's *node* count (a pooled expansion
+> creates no node) and 94.3 is reject's `nodes + rejections`. Both re-measured by counting
+> `apply_move` directly. The ratio is 2.3×, which is what this document's summary already said, so
+> **the retraction itself is unaffected** — it was fixed by `charge_rejections`, which is the right
+> mechanism regardless of how the diagnostic was labelled.
 
 I had checked this once, on the classical UCB1 cube, where the arm did stay inside budget
 (80 + 92 = 172 < 200) — and then generalised from that single check instead of re-verifying per
@@ -41,11 +48,18 @@ Blocksworld and cube). It is the accounting any comparative claim should be read
 
 **Blocksworld under GUCT-Uniform** (6 blocks, plan lengths 10/12/14, 12 puzzles, 10 repeats):
 
-| budget | merge | reject (charged) | diff | 95% CI | p | generations merge/reject |
+| budget | merge | reject (charged) | diff | 95% CI | p | nodes merge / reject |
 |---|---|---|---|---|---|---|
 | 100 | 0.217 | 0.217 | +0.000 | [−0.033, +0.033] | 1.0000 | 67 / 101 |
 | 300 | 0.550 | 0.558 | +0.008 | [−0.133, +0.150] | 0.8994 | 188 / 301 |
 | 1000 | 0.883 | 0.842 | −0.042 | [−0.125, +0.050] | 0.6758 | 589 / 1001 |
+
+> **Corrected 2026-09-24.** This column was labelled "generations merge/reject". Merge's figure is
+> its node count (equal to its hFF evaluation count); reject's is `nodes + rejections`. An audit that
+> counted `apply_move` directly in GUCT Blocksworld found merge spends exactly its budget and charged
+> reject spends budget +≤1, so the two arms are **compute-matched** here, not reject-heavy. Measured
+> at 5-block configurations, not these exact 6-block ones; the mechanism (one generation per
+> expansion, terminal edges closed after one visit, so no post-solve spinning) is the same.
 
 The +0.090 / +0.087 that this document previously reported are gone.
 
@@ -53,6 +67,13 @@ The +0.090 / +0.087 that this document previously reported are gone.
 the original (wrong) claim, which predicted a null here since GUCT-Uniform had already brought
 merge and tree to parity. Uncharged, the filter appeared to win enormously — +1.000 at six of
 twelve cube budget points, +0.900 on Sokoban — which looked like a refutation. Charged:
+
+> **Accounting note (2026-09-21).** In the "generations merge/reject" column below, the merge side
+> is a *node* count and the reject side is `nodes + rejections`; neither is an `apply_move` count.
+> A pooled expansion creates no node, so merge's compute is understated — by 2.27–2.45× on the cube
+> rows, magnitude unmeasured on the Blocksworld rows, where the reject column being exactly
+> budget+1 suggests the two arms are compute-matched rather than the filter being costlier. See
+> `MERGING_MECHANISM_SUMMARY.md`.
 
 | tier/budget | tree | merge | reject (charged) | diff | p | generations merge/reject |
 |---|---|---|---|---|---|---|
@@ -64,9 +85,14 @@ twelve cube budget points, +0.900 on Sokoban — which looked like a refutation.
 | td10/b110 | 0.325 | 0.325 | 0.367 | +0.042 | 0.1250 | 48 / 111 |
 
 Null, as the prediction said. **The prediction was right and the experiment that appeared to refute
-it was the thing at fault.** Note also that merge does not even spend its budget here (20
-generations against 40) because edge-closure exhausts the reachable graph first — it is the more
-compute-efficient arm, not merely the equal one.
+it was the thing at fault.**
+
+> **Retracted 2026-09-21.** This paragraph previously added that "merge does not even spend its
+> budget here (20 generations against 40) ... it is the more compute-efficient arm". False. 20 is
+> merge's node count; counting `apply_move` directly, merge spends **exactly its budget** in all six
+> rows of the table above (40.0 / 60.0 / 50.0 / 80.0 / 90.0 / 110.0), and the charged filter spends
+> marginally *more* (40.6 / 60.0 / 50.4 / 81.8 / 90.9 / 110.3). The arms are compute-matched here
+> and the filter is, if anything, the slightly more expensive one. The null result is unchanged.
 
 ## So the fixes are redundant
 
@@ -84,12 +110,17 @@ independently repairs the same failure, and neither adds anything on top of the 
 
 The one surviving classical headline, verified inside budget at every point:
 
-| tier/budget | tree | merge | reject (charged) | generations merge/reject |
+| tier/budget | tree | merge | reject (charged) | `apply_move` merge/reject |
 |---|---|---|---|---|
-| td6/b100 | 0.533 | 0.000 | **1.000** | 44 / 76 |
-| td8/b200 | 0.400 | 0.000 | **1.000** | 84 / 108 |
-| td10/b200 | 0.000 | 0.000 | **0.983** | 84 / 166 |
-| td10/b400 | 0.367 | 0.000 | **1.000** | 163 / 166 |
+| td6/b100 | 0.533 | 0.000 | **1.000** | 100 / 74.8 |
+| td8/b200 | 0.400 | 0.000 | **1.000** | 200 / 106.8 |
+| td10/b200 | 0.000 | 0.000 | **0.983** | 200 / 164.4 |
+| td10/b400 | 0.367 | 0.000 | **1.000** | 400 / 164.9 |
+
+> **Corrected 2026-09-21**, same mislabelling as above; see `MERGING_MECHANISM_SUMMARY.md`. The
+> filter staying under budget in the runs it wins is what `charge_rejections` has to guarantee, and
+> it does — but this is not evidence the filter is the more efficient arm (there is no solve-based
+> exit, so a solved run stops expanding while pooling spends to the last unit).
 
 Under UCB1 + MC-average on the cube the filter beats *both* tree and merge at charged budget. That
 is a real result and it is the one to keep.
