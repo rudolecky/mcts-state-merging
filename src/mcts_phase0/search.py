@@ -19,6 +19,7 @@ per function (see the approved plan for the reasoning):
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass, field
 
@@ -50,6 +51,18 @@ class Node:
     w_value: float = 0.0
     is_terminal_correct: bool | None = None
     has_been_expanded: bool = False
+    no_admissible_children: bool = False
+    """Set when this node has been expanded but `select_leaf` cannot descend
+    past it -- either every candidate its expansion produced was filtered as
+    a duplicate, or every child it does have is itself in this state.
+
+    Only reachable in a filtering arm. Without it, such a node keeps being
+    returned as the search leaf (`select_leaf`'s loop needs `node.children`
+    to descend) and `run_search` re-expands it: K fresh LLM generations that
+    will be filtered again for the same reason. Measured at up to 58% of the
+    arm's expansion budget spent producing nothing, invisible in every
+    recorded statistic. Excluded from selection, and propagated lazily up
+    the tree in `run_search`."""
     parents: list[int] = field(default_factory=list)
     children: list[Edge] = field(default_factory=list)
 
@@ -64,6 +77,14 @@ class SearchGraph:
     nodes: dict[int, Node]
     root_id: int
     depth_index: dict[tuple[int, str], list[int]] = field(default_factory=dict)
+    new_nodes: int = 0
+    merge_hits: int = 0
+    rejected: int = 0
+    expansions_used: int = 0
+    """Expansions `run_search` actually spent. Recorded because it is not
+    always equal to the budget: the loop can exit on its iteration cap
+    instead, whenever a terminal leaf dominates PUCT in a narrow tree."""
+    widenings: int = 0  # expansions spent re-sampling an already-expanded node, see widen_on_starvation
     _next_id: int = 1
 
     def new_node_id(self) -> int:
@@ -85,10 +106,93 @@ class SearchConfig:
     projection: FrozenProjection
     merge_enabled: bool
     tau: float = 0.0
+    reject_duplicates: bool = False
+    """Admission filter: an alternative to merging, not a modifier of it.
+
+    A candidate whose projected value lands within `tau` of an existing
+    node in the same (depth, kind) bucket is DISCARDED instead of pooled
+    into that node -- so the tree stays a tree, no node ever holds
+    statistics from more than one path, and the backup rule is untouched.
+
+    The motivation is the classical-domain result (see
+    `results/ARTICLE_DERIVED_MERGING_FINDINGS.md`): merging does two things at once,
+    deduplicating expansions and pooling their statistics, and the second
+    is where the harm lives. Under an approximate equivalence relation --
+    which is all a learned projection can offer -- the asymmetry is stark:
+    a wrong rejection costs one wasted candidate, while a wrong merge
+    corrupts a value estimate that then steers all later selection, and
+    that error compounds with depth.
+
+    A rejected candidate is treated exactly like the harness already
+    treats a candidate that yields no usable node (no step/answer boundary
+    within budget, or past `max_depth`): its `prior_share` is simply never
+    assigned, so total prior mass under a parent is <= 1 in every arm,
+    including the two that already existed."""
+    reject_answer_nodes: bool = False
+    """Whether the admission filter also applies to `answer` candidates.
+
+    Default False, and the default is the point. An answer candidate can be
+    VERIFIED -- ground truth is available at a terminal, and checking it
+    costs one verifier call against generation the harness has already paid
+    for. Filtering it on an approximate projected-value match instead would
+    throw away a possibly-correct solution on the strength of the one signal
+    this project has repeatedly found unreliable. Merge mode cannot avoid
+    this (the node is shared, so the newcomer's own correctness is
+    discarded either way); rejection can, and should.
+
+    Set True for the arm that is symmetric with merge mode. Both variants
+    are worth running: the difference between them measures exactly how
+    much the equivalence relation costs when it is allowed to overrule a
+    verifier."""
+    widen_on_starvation: bool = False
+    """Spend the budget a starved search would otherwise leave unspent.
+
+    A search starves when no unexpanded step node exists anywhere: every leaf
+    selection can only reach a terminal (or a fully filtered node), so the
+    loop spins on terminals until `max_iterations` with budget left.
+    Deduplication produces that state and plain search rarely does --
+    measured, it was the cause of every unsolved run that stopped short in
+    the published LLM runs (41/41), and it made the deduplicating arms run
+    on ~60% of the baseline's LLM samples (results/THIRD_MODEL_BUDGET_LEAK_FINDINGS.md).
+
+    When set, a starved iteration instead re-samples K fresh candidates at
+    the deepest non-answer node below `max_depth` on the path the search just
+    selected, and charges that as an expansion. It fires when the frontier is
+    empty, and also past the old 10 x budget iteration cap (where a run used
+    to end with budget unspent while PUCT declined a reachable frontier). A
+    run that neither starves nor reaches that cap behaves exactly as with
+    this off. Default False so previously recorded runs stay reproducible."""
+    stop_on_solve: bool = False
+    """End the search as soon as a verified-correct answer exists. Cannot
+    change `is_solved` (an answer, once verified, stays); it only stops a
+    solved search spending iterations it no longer needs, so
+    `expansions_used` reads as cost-to-solve."""
+    random_reject_rate: float = 0.0
+    """Random-rejection control. Each *step* candidate (answers exempt, as in
+    the filter) is discarded with this probability, regardless of any
+    equivalence relation. Matched to the filter's realized rejection rate it
+    separates the filter's two possible effects: deduplication (dropping
+    candidates that ARE equivalent to something kept) versus forced depth
+    (dropping candidates at all, which concentrates the budget). The draw is
+    a hash of the candidate's tokens, the expansion counter and its index in
+    the batch -- deterministic, no shared RNG state, and two identical draws
+    in one batch are decided independently. A discarded candidate's prior
+    share is dropped, as for a dead candidate."""
     max_depth: int = 6
     value_source: str = "projection"  # "projection" | "rollout" -- see C6 ablation, guide_value is what this controls
     num_rollouts: int = 4
     rollout_max_new_tokens: int = 80
+
+    def __post_init__(self) -> None:
+        if self.merge_enabled and self.reject_duplicates:
+            raise ValueError("reject_duplicates is only meaningful with merge_enabled=False")
+        if not 0.0 <= self.random_reject_rate <= 1.0:
+            raise ValueError("random_reject_rate must be in [0, 1]")
+        if self.random_reject_rate and (self.merge_enabled or self.reject_duplicates):
+            # A control for the filter, run on the plain tree. Stacked on a
+            # relation it would measure neither.
+            raise ValueError("random_reject_rate is a control on the plain tree; "
+                             "it cannot be combined with merge_enabled or reject_duplicates")
 
 
 def create_root(prompt_ids: torch.Tensor, prompt_len: int) -> SearchGraph:
@@ -108,8 +212,11 @@ def select_leaf(graph: SearchGraph, config: SearchConfig) -> list[int]:
     path = [graph.root_id]
     node = graph.nodes[graph.root_id]
     while node.kind not in ("answer", "exhausted") and node.has_been_expanded and node.children:
+        admissible = [e for e in node.children if not graph.nodes[e.child_id].no_admissible_children]
+        if not admissible:
+            break  # every continuation from here is blocked -- run_search marks this node
         best_edge = max(
-            node.children,
+            admissible,
             key=lambda e: _puct_score(node, e, graph.nodes[e.child_id], config.c_puct),
         )
         node = graph.nodes[best_edge.child_id]
@@ -135,7 +242,17 @@ def find_merge_target(graph: SearchGraph, new_depth: int, new_kind: str, proj_va
     bucket = graph.depth_index.get((new_depth, new_kind), [])
     best_id, best_dist = None, None
     for cand_id in bucket:
-        dist = abs(graph.nodes[cand_id].proj_value - proj_value)
+        cand = graph.nodes[cand_id]
+        if cand.kind == "exhausted" or cand.no_admissible_children:
+            # `register` indexes by kind at registration time and
+            # `expand_node` mutates `kind` to "exhausted" without reindexing,
+            # so the bucket still holds nodes already proven to go nowhere.
+            # Matching one is bad in both arms -- the merge arm at least
+            # keeps an edge to the dead end, while a filtering arm destroys
+            # the candidate and leaves a known dead end as the sole
+            # representative of its equivalence class.
+            continue
+        dist = abs(cand.proj_value - proj_value)
         if best_dist is None or dist < best_dist:
             best_id, best_dist = cand_id, dist
     if best_id is not None and best_dist < tau:
@@ -150,7 +267,7 @@ def expand_node(lm, graph: SearchGraph, node_id: int, instance, verifier_fn, con
     layer_idx_map = _resolve_layer_indices(lm.num_hidden_layers)
 
     any_alive = False
-    for full_ids in candidates:
+    for cand_idx, full_ids in enumerate(candidates):
         step_boundaries = find_step_boundaries(lm.tokenizer, graph.problem_prompt_len, full_ids)
         answer_idx = find_answer_boundary(lm.tokenizer, graph.problem_prompt_len, full_ids)
         new_step_idx = step_boundaries[parent.depth] if len(step_boundaries) > parent.depth else None
@@ -167,6 +284,11 @@ def expand_node(lm, graph: SearchGraph, node_id: int, instance, verifier_fn, con
             continue
 
         child_full_ids = full_ids[: boundary_idx + 1]
+        if new_kind == "step" and config.random_reject_rate and _random_reject(
+                child_full_ids, graph.expansions_used, cand_idx, config.random_reject_rate):
+            graph.rejected += 1
+            any_alive = True  # as in the filter: the expansion did work, the parent is not exhausted
+            continue
         hidden = hidden_states_for_sequence(lm, child_full_ids)
         hidden_vecs = {
             name: hidden[idx][0, boundary_idx, :].float().cpu().numpy()
@@ -175,8 +297,42 @@ def expand_node(lm, graph: SearchGraph, node_id: int, instance, verifier_fn, con
         proj_value = apply_projection(hidden_vecs[config.projection.layer], config.projection)
 
         target_id = None
-        if config.merge_enabled:
+        if config.merge_enabled or config.reject_duplicates:
             target_id = find_merge_target(graph, new_depth, new_kind, proj_value, config.tau)
+
+        if target_id is not None and config.reject_duplicates:
+            if new_kind != "answer" or config.reject_answer_nodes:
+                # Admission filter: an equivalent state is already in the
+                # tree, so drop this candidate rather than pooling into it.
+                #
+                # Its prior share is still credited to the surviving sibling
+                # when that sibling is already a child of THIS parent. That
+                # is deliberate and it is what keeps `treatment` - `reject`
+                # a measurement of statistic pooling alone: `_find_or_add_edge`
+                # accumulates prior on a repeat target, so the merge arm turns
+                # duplicate draws into prior mass ("3 of K samples landed
+                # here" -- which is exactly what PUCT's P term is supposed to
+                # be). Dropping it would have handed the merge arm a 1.2
+                # absolute advantage in the exploration term at c_puct=1.5,
+                # against a Q component that only spans [0, 1] -- a
+                # first-order confound, not a rounding effect. Crediting the
+                # prior shares the *policy* signal without sharing
+                # `n_visits`/`w_value`, which is the split this arm is about.
+                #
+                # A cross-branch duplicate (the target hangs under a different
+                # parent) still drops its share, exactly as the pre-existing
+                # dead-candidate `continue` paths do -- there is no sibling
+                # edge to credit it to.
+                if any(e.child_id == target_id for e in parent.children):
+                    _find_or_add_edge(parent, target_id, prior_share)
+                graph.rejected += 1
+                any_alive = True  # the expansion did real work; the parent is not exhausted
+                continue
+            # Spared answer candidate: it gets its OWN node. Clearing
+            # target_id matters -- leaving it set would fall through into the
+            # merge branch below and pool this candidate into the existing
+            # node, which is the one thing this arm must never do.
+            target_id = None
 
         if target_id is not None:
             target = graph.nodes[target_id]
@@ -184,6 +340,7 @@ def expand_node(lm, graph: SearchGraph, node_id: int, instance, verifier_fn, con
             if parent.node_id not in target.parents:
                 target.parents.append(parent.node_id)
             _find_or_add_edge(parent, target_id, prior_share)
+            graph.merge_hits += 1
         else:
             new_id = graph.new_node_id()
             new_node = Node(
@@ -194,7 +351,7 @@ def expand_node(lm, graph: SearchGraph, node_id: int, instance, verifier_fn, con
                 # C6 ablation: guide search with an actual rollout estimate instead of the
                 # projection, while the merge decision above still used the projection --
                 # isolates "fewer wasted nodes" from "value-guidance quality" (see
-                # PLAN_GATE_REVIEW.md). Only paid for newly-created nodes, never merge
+                # results/PLAN_GATE_REVIEW.md). Only paid for newly-created nodes, never merge
                 # targets, so merge_enabled=True arms make fewer of these calls by construction.
                 new_node.guide_value = score_rollouts(
                     lm, instance, verifier_fn, child_full_ids, graph.problem_prompt_len,
@@ -202,6 +359,7 @@ def expand_node(lm, graph: SearchGraph, node_id: int, instance, verifier_fn, con
                 )
             assert new_node.depth == parent.depth + 1
             graph.register(new_node)
+            graph.new_nodes += 1
             _find_or_add_edge(parent, new_id, prior_share)
             target_id = new_id
 
@@ -216,8 +374,36 @@ def expand_node(lm, graph: SearchGraph, node_id: int, instance, verifier_fn, con
         any_alive = True
 
     parent.has_been_expanded = True
-    if not any_alive:
+    if not any_alive and not parent.children:
+        # `not parent.children` only matters on a re-expansion (widening):
+        # on a first expansion, no live candidate means no edge was added.
         parent.kind = "exhausted"
+
+
+def _random_reject(child_full_ids, expansion_no: int, cand_idx: int, rate: float) -> bool:
+    h = hashlib.sha256(f"{expansion_no}|{cand_idx}|".encode())
+    h.update(child_full_ids.detach().cpu().numpy().astype("int64").tobytes())
+    return int.from_bytes(h.digest()[:8], "big") / float(1 << 64) < rate
+
+
+def _has_frontier(graph: SearchGraph) -> bool:
+    """Whether any node could still be expanded for the first time."""
+    return any(n.kind in ("root", "step") and not n.has_been_expanded for n in graph.nodes.values())
+
+
+def _is_solved_now(graph: SearchGraph) -> bool:
+    return any(n.kind == "answer" and n.is_terminal_correct for n in graph.nodes.values())
+
+
+def _widen(lm, graph: SearchGraph, node_id: int, instance, verifier_fn, config: SearchConfig) -> None:
+    """Re-sample at an already-expanded node. An exhausted node gets its
+    kind back first, so the expansion can mark it exhausted again (or not)."""
+    node = graph.nodes[node_id]
+    if node.kind == "exhausted":
+        node.kind = "root" if node_id == graph.root_id else "step"
+    node.no_admissible_children = False
+    expand_node(lm, graph, node_id, instance, verifier_fn, config)
+    graph.widenings += 1
 
 
 def backup(graph: SearchGraph, path: list[int], value: float) -> None:
@@ -235,17 +421,56 @@ def run_search(lm, prompt_ids: torch.Tensor, prompt_len: int, instance, verifier
     graph = create_root(prompt_ids, prompt_len)
     expansions_used = 0
     iterations = 0
-    max_iterations = 10 * budget
+    # The old loop gave up at 10 x budget iterations, even with budget left
+    # and a reachable frontier PUCT kept declining to visit (selection can
+    # prefer known-wrong terminals under an inflated prior). With widening on,
+    # a run is IDENTICAL to the old code up to that point; past it, every
+    # terminal selection widens, so every iteration spends budget and the
+    # loop is bounded by 20 x budget.
+    old_cap = 10 * budget
+    max_iterations = 20 * budget if config.widen_on_starvation else old_cap
     while expansions_used < budget and iterations < max_iterations:
         iterations += 1
+        if config.stop_on_solve and _is_solved_now(graph):
+            break
         path = select_leaf(graph, config)
         leaf = graph.nodes[path[-1]]
         if leaf.kind in ("answer", "exhausted"):
             value = 1.0 if leaf.is_terminal_correct else 0.0
             backup(graph, path, value)
+            if config.widen_on_starvation and (iterations > old_cap or not _has_frontier(graph)):
+                # Never a node at max_depth: every candidate it draws is
+                # discarded for depth, so the K samples would be wasted.
+                target = next(nid for nid in reversed(path)
+                              if graph.nodes[nid].kind != "answer" and graph.nodes[nid].depth < config.max_depth)
+                _widen(lm, graph, target, instance, verifier_fn, config)
+                expansions_used += 1
+                graph.expansions_used = expansions_used
+            continue
+        if leaf.has_been_expanded:
+            # `select_leaf` returned an already-expanded, non-terminal node,
+            # which means it could not descend past it. Pre-existing arms
+            # never produce this (every non-continue path in `expand_node`
+            # adds an edge, and an all-continue expansion sets kind
+            # "exhausted"); a filtering arm does, whenever an expansion's
+            # every candidate was a duplicate. Re-expanding regenerates the
+            # same duplicates, so mark the node and refresh its own estimate
+            # instead -- NOT with 0.0, which would tell the parent that a
+            # merely-duplicate continuation is worthless and reintroduce the
+            # value corruption this arm exists to avoid.
+            leaf.no_admissible_children = True
+            backup(graph, path, leaf.guide_value if leaf.node_id != graph.root_id else 0.5)
+            if leaf.node_id == graph.root_id:
+                if config.widen_on_starvation:
+                    _widen(lm, graph, leaf.node_id, instance, verifier_fn, config)
+                    expansions_used += 1
+                    graph.expansions_used = expansions_used
+                    continue
+                break  # nothing anywhere is admissible; the search is done
             continue
         expand_node(lm, graph, leaf.node_id, instance, verifier_fn, config)
         expansions_used += 1
+        graph.expansions_used = expansions_used
         value = leaf.guide_value if leaf.node_id != graph.root_id else 0.5
         backup(graph, path, value)
     return graph

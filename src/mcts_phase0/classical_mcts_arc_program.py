@@ -2,7 +2,9 @@
 search space -- no heuristic exists here any more than it did for
 Blocksworld's blind arc (`classical_mcts_blocksworld.py`), so this mirrors
 that module's shape closely: random rollout up to a depth cap, checking for
-an exact goal match after every step, reward 1.0/0.0.
+a goal match after every step. Reward is 1.0/0.0 by default
+(`reward_mode="binary"`) or graded by `engine.goal_progress`
+(`reward_mode="graded"`) -- see `ClassicalMCTSConfig`.
 
 Cycle-safety IS needed here after all, for a reason specific to how the
 merge-mode key is computed. `canonical_key` is a *set* of a state's
@@ -50,6 +52,14 @@ class MCTSNode:
     children: dict = field(default_factory=dict)  # move -> MCTSEdge
     untried_moves: list = field(default_factory=list)
     is_terminal: bool = False
+    exhausted: bool = False
+    """Reject-duplicates arm only: this node has no untried moves left and
+    `select()` could not descend past it, so nothing new can ever come from
+    it. Without marking it, it stays the most attractive frontier node its
+    parent has and gets re-selected for rollout-only iterations forever --
+    which burns the iteration allowance (20x budget) without spending a
+    single expansion, so the arm silently runs at a fraction of the budget
+    the other arms get. Marked nodes are excluded from `select()`."""
 
 
 @dataclass
@@ -57,6 +67,15 @@ class MCTSGraph:
     nodes: dict
     root_key: object
     next_id: int = 0
+    seen_state_keys: set = field(default_factory=set)
+    """Only populated in the reject-duplicates arm, where node keys are
+    path-based (so `nodes` cannot answer "has this state been seen")."""
+    new_nodes: int = 0
+    """Nodes created by an expansion. Excludes the root, matching
+    `classical_mcts_rubiks.py`'s pre-existing `stats["new_nodes"]`
+    convention, so the counter means the same thing in every module."""
+    merge_hits: int = 0
+    rejected: int = 0
 
 
 @dataclass
@@ -64,7 +83,46 @@ class ClassicalMCTSConfig:
     merge_enabled: bool
     c: float = 1.4
     moves_per_node: int = 25
+    reward_mode: str = "binary"
+    """"binary" (original): rollouts return 1.0 iff the goal was reached,
+    else 0.0. "graded": rollouts return the best `engine.goal_progress`
+    seen along the walk. Merging works by pooling statistics, and pooling
+    zeros carries no information -- ARC is the sparsest-reward domain in
+    this repo and shows its smallest merge effect, so reward density is a
+    candidate mechanism, testable by running both modes."""
+    merge_key_mode: str = "typed"
+    """Equivalence relation for merge keys, passed to
+    `engine.canonical_key`: "typed" (original) or "values" (coarser,
+    observational-equivalence flavored). Also used by the
+    reject-duplicates arm to decide what counts as a duplicate."""
+    reject_duplicates: bool = False
+    """Third arm, only meaningful with `merge_enabled=False`: compute the
+    merge key but DISCARD a child whose state was already reached anywhere,
+    instead of pooling into the existing node. Keeps the tree a tree, so
+    no statistics are ever aggregated and the backup rule is untouched --
+    which isolates "expansions land on distinct states" from "statistics
+    from different paths get pooled". Those are the two things ordinary
+    merging does at once, and the Rubik's Cube result says the second one
+    is where the risk lives.
 
+    Budget accounting: a rejected move never becomes an expansion, so it
+    does not count against the expansion budget -- consistent with this
+    project's convention that budget counts expansions. It does cost a real
+    `apply_move`, though, so this arm does strictly more work per unit of
+    budget than the other two; that difference shows up only in wall-clock,
+    which is why wall-clock is reported next to every arm's node count."""
+
+
+
+    def __post_init__(self):
+        if self.merge_enabled and self.reject_duplicates:
+            # These two do not compose, and the way they fail to compose
+            # differs per module (one silently disables merging, another
+            # silently ignores the rejection), so the combination is
+            # refused rather than left to mean whatever the code happens
+            # to do. `reject_duplicates` is an alternative to merging, not
+            # a modifier of it.
+            raise ValueError("reject_duplicates is only meaningful with merge_enabled=False")
 
 def _make_node(program_state: engine.ProgramState, target_outputs: tuple, config: ClassicalMCTSConfig, rng: random.Random) -> MCTSNode:
     solved = engine.is_goal(program_state, target_outputs)
@@ -76,9 +134,12 @@ def create_root(train_inputs: tuple, target_outputs: tuple, config: ClassicalMCT
     state = engine.create_initial_state(train_inputs)
     root = _make_node(state, target_outputs, config, rng)
     if config.merge_enabled:
-        root_key = engine.canonical_key(state)
+        root_key = engine.canonical_key(state, config.merge_key_mode)
         return MCTSGraph(nodes={root_key: root}, root_key=root_key)
-    return MCTSGraph(nodes={0: root}, root_key=0, next_id=1)
+    seen = set()
+    if config.reject_duplicates:
+        seen.add(engine.canonical_key(state, config.merge_key_mode))
+    return MCTSGraph(nodes={0: root}, root_key=0, next_id=1, seen_state_keys=seen)
 
 
 def _ucb1_score(parent: MCTSNode, edge: MCTSEdge, child: MCTSNode, c: float) -> float:
@@ -97,7 +158,8 @@ def select(graph: MCTSGraph, config: ClassicalMCTSConfig) -> tuple[list, list]:
     path_moves: list = []
     node = graph.nodes[graph.root_key]
     while not node.is_terminal and not node.untried_moves and node.children:
-        candidates = {m: e for m, e in node.children.items() if e.child_key not in path_set}
+        candidates = {m: e for m, e in node.children.items()
+                      if e.child_key not in path_set and not graph.nodes[e.child_key].exhausted}
         if not candidates:
             break
         best_move = max(
@@ -141,15 +203,44 @@ def expand(graph: MCTSGraph, leaf_key, target_outputs: tuple, config: ClassicalM
         if new_state is None:
             continue
         if config.merge_enabled:
-            child_key = engine.canonical_key(new_state)
+            child_key = engine.canonical_key(new_state, config.merge_key_mode)
         else:
+            if config.reject_duplicates:
+                state_key = engine.canonical_key(new_state, config.merge_key_mode)
+                if state_key in graph.seen_state_keys:
+                    graph.rejected += 1
+                    continue  # admission filter: this state exists already, try another move
+                graph.seen_state_keys.add(state_key)
             child_key = graph.next_id
             graph.next_id += 1
         if child_key not in graph.nodes:
             graph.nodes[child_key] = _make_node(new_state, target_outputs, config, rng)
+            graph.new_nodes += 1
+        else:
+            graph.merge_hits += 1
         node.children[move] = MCTSEdge(child_key=child_key)
         return child_key, move
     return None
+
+
+def _mark_exhausted(graph: MCTSGraph, leaf_key, leaf: MCTSNode, config: ClassicalMCTSConfig) -> bool:
+    """Reject-duplicates arm only. Marks a dead frontier node so `select()`
+    stops returning it, and reports whether the whole search is finished --
+    which is the case exactly when the dead node is the root, since
+    `select()` can only return an exhausted node when it had no
+    non-exhausted alternative anywhere above it."""
+    if not config.reject_duplicates:
+        return False
+    if leaf.untried_moves:
+        return False
+    if any(not graph.nodes[e.child_key].exhausted for e in leaf.children.values()):
+        # Still has a live subtree. `select()` returns nodes that have BOTH
+        # untried moves and existing children, so a node whose remaining
+        # untried moves were all rejected is NOT dead -- marking it here
+        # would make `select()` skip it and orphan every live descendant.
+        return False
+    leaf.exhausted = True
+    return leaf_key == graph.root_key
 
 
 def backup(graph: MCTSGraph, path: list, path_moves: list, value: float) -> None:
@@ -163,8 +254,16 @@ def backup(graph: MCTSGraph, path: list, path_moves: list, value: float) -> None
 
 
 def simulate(program_state: engine.ProgramState, target_outputs: tuple, rollout_depth: int, config: ClassicalMCTSConfig, rng: random.Random) -> float:
+    """Returns 1.0 iff the goal is reached during the walk. Otherwise 0.0
+    under `reward_mode="binary"`, or the best `engine.goal_progress` seen
+    at any point on the walk (including the starting state) under
+    `reward_mode="graded"`. Reaching the goal implies progress 1.0, so the
+    two modes agree exactly on solved rollouts and differ only in what an
+    unsolved rollout reports."""
+    graded = config.reward_mode == "graded"
     if engine.is_goal(program_state, target_outputs):
         return 1.0
+    best = engine.goal_progress(program_state, target_outputs) if graded else 0.0
     state = program_state
     for _ in range(rollout_depth):
         moves = engine.legal_moves(state, rng, config.moves_per_node)
@@ -175,14 +274,33 @@ def simulate(program_state: engine.ProgramState, target_outputs: tuple, rollout_
             if next_state is not None:
                 break
         if next_state is None:
-            return 0.0
+            return best
         state = next_state
-        if engine.is_goal(state, target_outputs):
+        # Incremental checks: the walk already established that every
+        # earlier index misses, and each step appends exactly one value, so
+        # only that value can change the answer. Equivalent to the full
+        # scan, without its O(context length) cost on every step.
+        if engine.last_value_is_goal(state, target_outputs):
             return 1.0
-    return 0.0
+        if graded:
+            best = max(best, engine.last_value_progress(state, target_outputs))
+    return best
 
 
-def run_search(train_inputs: tuple, target_outputs: tuple, config: ClassicalMCTSConfig, budget: int, rollout_depth: int, rng: random.Random) -> MCTSGraph:
+def run_search(train_inputs: tuple, target_outputs: tuple, config: ClassicalMCTSConfig, budget: int, rollout_depth: int, rng: random.Random,
+               stop_on_solve: bool = False) -> MCTSGraph:
+    """`stop_on_solve` returns as soon as an expansion first reaches a goal
+    instead of running the remaining budget out. Off by default, and it
+    cannot change any solve rate, since budget is spent only on expansions.
+
+    It exists because the node-count and wall-clock columns are otherwise
+    not comparable across arms. Once a terminal node exists, `select()`
+    keeps returning it (its Q is maximal) and the loop re-backs-up 1.0
+    without consuming expansion budget, until the 20x-budget iteration cap.
+    So a solved run freezes its node count at the solve point and then
+    burns cheap iterations -- meaning an arm that solves MORE often reports
+    fewer nodes and different wall-clock for reasons that have nothing to
+    do with its efficiency."""
     graph = create_root(train_inputs, target_outputs, config, rng)
     expansions_used = 0
     iterations = 0
@@ -197,13 +315,18 @@ def run_search(train_inputs: tuple, target_outputs: tuple, config: ClassicalMCTS
         if not leaf.untried_moves:
             value = simulate(leaf.program_state, target_outputs, rollout_depth, config, rng)
             backup(graph, path, path_moves, value)
+            if _mark_exhausted(graph, path[-1], leaf, config):
+                break
             continue
         expanded = expand(graph, path[-1], target_outputs, config, rng)
         if expanded is None:
-            # every untried move failed at real execution (see safe_apply_move) --
-            # equivalent to the leaf having no untried moves after all.
+            # every untried move failed at real execution (see safe_apply_move),
+            # or was rejected as a duplicate -- equivalent to the leaf having
+            # had no untried moves at all.
             value = simulate(leaf.program_state, target_outputs, rollout_depth, config, rng)
             backup(graph, path, path_moves, value)
+            if _mark_exhausted(graph, path[-1], leaf, config):
+                break
             continue
         child_key, move = expanded
         expansions_used += 1
@@ -212,6 +335,8 @@ def run_search(train_inputs: tuple, target_outputs: tuple, config: ClassicalMCTS
         child = graph.nodes[child_key]
         value = 1.0 if child.is_terminal else simulate(child.program_state, target_outputs, rollout_depth, config, rng)
         backup(graph, path, path_moves, value)
+        if stop_on_solve and child.is_terminal:
+            break
     return graph
 
 

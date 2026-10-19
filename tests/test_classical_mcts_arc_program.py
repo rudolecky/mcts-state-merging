@@ -102,3 +102,100 @@ def test_merge_mode_never_creates_more_nodes_than_tree_mode_for_the_same_budget(
     rng = random.Random(0)
     merge_graph = m.run_search(task.train_inputs, task.train_outputs, m.ClassicalMCTSConfig(merge_enabled=True), budget=150, rollout_depth=5, rng=rng)
     assert len(merge_graph.nodes) <= len(tree_graph.nodes)
+
+
+# ---------- article-derived items: goal/key consistency, graded reward, reject arm ----------
+
+def test_make_node_marks_terminal_for_a_goal_at_a_non_final_index():
+    """`_make_node` caches `is_terminal` once per merge key, so goal-ness
+    has to be a function of that key -- the old `ctx[-1]` test was not.
+    The states that would expose it are unreachable in the current search
+    (see `engine.goal_index`), so this pins an invariant rather than
+    recovering lost solves."""
+    task = _load_real_task("68b16354")
+    config = m.ClassicalMCTSConfig(merge_enabled=True)
+    rng = random.Random(0)
+    state = engine.create_initial_state(task.train_inputs)
+    mirrored = engine.apply_move(state, ("hmirror", (("ctx", 0),)))
+    kept_going = engine.apply_move(mirrored, ("width", (("ctx", 0),)))
+
+    assert engine.canonical_key(kept_going) != engine.canonical_key(mirrored)
+    assert m._make_node(mirrored, task.train_outputs, config, rng).is_terminal is True
+    # target is at index 1, not last -- still terminal.
+    assert m._make_node(kept_going, task.train_outputs, config, rng).is_terminal is True
+
+
+def test_same_merge_key_states_agree_on_terminality():
+    task = _load_real_task("68b16354")
+    config = m.ClassicalMCTSConfig(merge_enabled=True)
+    rng = random.Random(0)
+    state = engine.create_initial_state(task.train_inputs)
+    goal_last = engine.apply_move(
+        engine.apply_move(state, ("width", (("ctx", 0),))), ("hmirror", (("ctx", 0),)))
+    goal_first = engine.apply_move(
+        engine.apply_move(state, ("hmirror", (("ctx", 0),))), ("width", (("ctx", 0),)))
+    assert engine.canonical_key(goal_last) == engine.canonical_key(goal_first)
+    a = m._make_node(goal_last, task.train_outputs, config, rng)
+    b = m._make_node(goal_first, task.train_outputs, config, rng)
+    assert a.is_terminal == b.is_terminal is True
+
+
+def test_graded_reward_returns_partial_credit_where_binary_returns_zero():
+    """Same unsolvable-in-one-step state, two reward modes: binary reports
+    nothing, graded reports the cell-level overlap it actually achieved."""
+    task = _load_real_task("68b16354")
+    state = engine.create_initial_state(task.train_inputs)
+    binary = m.ClassicalMCTSConfig(merge_enabled=False, reward_mode="binary")
+    graded = m.ClassicalMCTSConfig(merge_enabled=False, reward_mode="graded")
+    # rollout_depth=0 -> no moves taken, so the value is entirely the
+    # starting state's own score under each mode.
+    assert m.simulate(state, task.train_outputs, 0, binary, random.Random(0)) == 0.0
+    graded_value = m.simulate(state, task.train_outputs, 0, graded, random.Random(0))
+    assert 0.0 < graded_value < 1.0
+    assert graded_value == engine.goal_progress(state, task.train_outputs)
+
+
+def test_graded_reward_still_reports_one_on_a_solved_rollout():
+    task = _load_real_task("68b16354")
+    solved = engine.apply_move(engine.create_initial_state(task.train_inputs), ("hmirror", (("ctx", 0),)))
+    for mode in ("binary", "graded"):
+        config = m.ClassicalMCTSConfig(merge_enabled=False, reward_mode=mode)
+        assert m.simulate(solved, task.train_outputs, 3, config, random.Random(0)) == 1.0
+
+
+def test_reject_duplicates_keeps_every_node_state_unique_without_pooling():
+    task = _load_real_task("68b16354")
+    config = m.ClassicalMCTSConfig(merge_enabled=False, reject_duplicates=True)
+    rng = random.Random(3)
+    graph = m.run_search(task.train_inputs, task.train_outputs, config, budget=150, rollout_depth=5, rng=rng)
+
+    # No pooling ever happened: path-keyed nodes, one incoming edge each.
+    assert graph.merge_hits == 0
+    in_degree = {}
+    for node in graph.nodes.values():
+        for edge in node.children.values():
+            in_degree[edge.child_key] = in_degree.get(edge.child_key, 0) + 1
+    assert all(d == 1 for d in in_degree.values())
+
+    # Every node holds a distinct state, which is the point of the arm.
+    keys = [engine.canonical_key(n.program_state) for n in graph.nodes.values()]
+    assert len(set(keys)) == len(keys)
+
+
+def test_reject_duplicates_actually_rejects_on_a_domain_with_transpositions():
+    task = _load_real_task("68b16354")
+    rng = random.Random(7)
+    config = m.ClassicalMCTSConfig(merge_enabled=False, reject_duplicates=True)
+    graph = m.run_search(task.train_inputs, task.train_outputs, config, budget=400, rollout_depth=3, rng=rng)
+    assert graph.rejected > 0
+
+
+def test_values_key_mode_merges_at_least_as_much_as_typed():
+    task = _load_real_task("68b16354")
+    counts = {}
+    for mode in ("typed", "values"):
+        config = m.ClassicalMCTSConfig(merge_enabled=True, merge_key_mode=mode)
+        graph = m.run_search(task.train_inputs, task.train_outputs, config, budget=300,
+                             rollout_depth=3, rng=random.Random(11))
+        counts[mode] = graph.merge_hits
+    assert counts["values"] >= counts["typed"]

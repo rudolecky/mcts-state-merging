@@ -43,15 +43,26 @@ def _stats(rows, key_a, key_b):
     return diffs.mean(), ci, p
 
 
-def run_tier(target_distance, c, budgets, n_puzzles, repeats, rollout_depth, distances, seed=0):
+def run_tier(target_distance, c, budgets, n_puzzles, repeats, rollout_depth, distances, seed=0, reject=False,
+             charge=False):
+    """`reject` adds a third comparison (stage3): tree vs. the
+    reject-duplicates admission filter, which keeps path-based node keys --
+    so no statistics are ever pooled and the backup rule is untouched --
+    but discards an expansion landing on an already-seen state. Merging on
+    this domain drops the solve rate to exactly zero at every budget and
+    difficulty, and both capping mitigations failed as a cliff; this arm
+    keeps merging's distinctness and drops only its pooling, which is the
+    half the failure was traced to."""
     puzzles = rc.generate_puzzles(n=n_puzzles, seed=seed, target_distance=target_distance, distances=distances)
     tier_results = {"target_distance": target_distance, "c": c, "stage1": [], "stage2": []}
+    if reject:
+        tier_results["stage3"] = []
 
     for budget in budgets:
         t0 = time.time()
-        rows1, rows2 = [], []
+        rows1, rows2, rows3 = [], [], []
         for i, inst in enumerate(puzzles):
-            oracle_solved = random_solved = merge_solved = 0
+            oracle_solved = random_solved = merge_solved = reject_solved = 0
             for r in range(repeats):
                 rng = random.Random(i * 100003 + r)
                 cfg_tree = ClassicalMCTSConfig(merge_enabled=False, value_source="oracle", c=c)
@@ -65,8 +76,17 @@ def run_tier(target_distance, c, budgets, n_puzzles, repeats, rollout_depth, dis
                 cfg_merge = ClassicalMCTSConfig(merge_enabled=True, value_source="oracle", c=c)
                 g_merge = run_search(inst.start_state, cfg_merge, budget, rollout_depth, rng3, distances=distances)
                 merge_solved += int(is_solved(g_merge))
+
+                if reject:
+                    rng4 = random.Random(i * 100003 + r)
+                    cfg_reject = ClassicalMCTSConfig(merge_enabled=False, reject_duplicates=True,
+                                                     value_source="oracle", c=c, charge_rejections=charge)
+                    g_reject = run_search(inst.start_state, cfg_reject, budget, rollout_depth, rng4, distances=distances)
+                    reject_solved += int(is_solved(g_reject))
             rows1.append({"id": inst.id, "tree": oracle_solved / repeats, "random": random_solved / repeats})
             rows2.append({"id": inst.id, "tree": oracle_solved / repeats, "merge": merge_solved / repeats})
+            if reject:
+                rows3.append({"id": inst.id, "tree": oracle_solved / repeats, "reject": reject_solved / repeats})
 
         tm, rm, dm1, ci1, p1 = np.mean([r["tree"] for r in rows1]), np.mean([r["random"] for r in rows1]), *_stats(rows1, "tree", "random")
         _, _, dm2, ci2, p2 = 0, 0, *_stats(rows2, "tree", "merge")
@@ -77,6 +97,12 @@ def run_tier(target_distance, c, budgets, n_puzzles, repeats, rollout_depth, dis
               f"CI=[{ci2[0]:.3f},{ci2[1]:.3f}] p={p2:.4f} (t={elapsed:.1f}s)")
         tier_results["stage1"].append({"budget": budget, "tree": tm, "random": rm, "diff": dm1, "ci": ci1, "p": p1})
         tier_results["stage2"].append({"budget": budget, "tree": tm, "merge": mm, "diff": dm2, "ci": ci2, "p": p2})
+        if reject:
+            dm3, ci3, p3 = _stats(rows3, "tree", "reject")
+            jm = np.mean([r["reject"] for r in rows3])
+            print(f"  td={target_distance} budget={budget}: reject={jm:.3f} reject_diff={dm3:.3f} "
+                  f"CI=[{ci3[0]:.3f},{ci3[1]:.3f}] p={p3:.4f}")
+            tier_results["stage3"].append({"budget": budget, "tree": tm, "reject": jm, "diff": dm3, "ci": ci3, "p": p3})
     return tier_results
 
 
@@ -88,6 +114,12 @@ def main():
     ap.add_argument("--repeats", type=int, default=30)
     ap.add_argument("--rollout-depth", type=int, default=15)
     ap.add_argument("--distances-path", default="results/rubiks_cube_bfs_distances.pkl")
+    ap.add_argument("--reject", action="store_true",
+                    help="also run the reject-duplicates arm (stage3): merging's "
+                         "distinctness without its statistic pooling. Off by default so the "
+                         "published two-stage run is unchanged.")
+    ap.add_argument("--charge-rejections", action="store_true",
+                    help="charge each rejected move against the budget (a rejection still costs a real state generation). Required for any filter-vs-merge comparison at matched compute; off by default only so previously recorded uncharged runs stay reproducible.")
     ap.add_argument("--output", default="results/heuristic_merge_experiment_rubiks.json")
     args = ap.parse_args()
 
@@ -99,15 +131,18 @@ def main():
     print("=== RUBIK'S CUBE, td=6, c=0.02 ===")
     all_results.append(run_tier(target_distance=6, c=0.02, budgets=[50, 100, 200, 300],
                                  n_puzzles=args.n_puzzles, repeats=args.repeats,
-                                 rollout_depth=args.rollout_depth, distances=distances))
+                                 rollout_depth=args.rollout_depth, distances=distances, reject=args.reject,
+                                 charge=args.charge_rejections))
     print("=== RUBIK'S CUBE, td=8, c=0.02 ===")
     all_results.append(run_tier(target_distance=8, c=0.02, budgets=[100, 200, 400, 600],
                                  n_puzzles=args.n_puzzles, repeats=args.repeats,
-                                 rollout_depth=args.rollout_depth, distances=distances))
+                                 rollout_depth=args.rollout_depth, distances=distances, reject=args.reject,
+                                 charge=args.charge_rejections))
     print("=== RUBIK'S CUBE, td=10, c=0.02 ===")
     all_results.append(run_tier(target_distance=10, c=0.02, budgets=[200, 400, 800, 1200],
                                  n_puzzles=args.n_puzzles, repeats=args.repeats,
-                                 rollout_depth=args.rollout_depth, distances=distances))
+                                 rollout_depth=args.rollout_depth, distances=distances, reject=args.reject,
+                                 charge=args.charge_rejections))
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -6,6 +6,18 @@ finding k_plies=1 immediate-win puzzles from the existing generator it
 was never shown during training), not to reach real playing strength.
 Checkpointed every iteration (weights + optimizer + replay buffer +
 iteration count) since this is expected to span multiple sessions.
+
+`--selfplay-merge/--no-selfplay-merge` exists for a comparison this project
+has not yet run. Merging was found structurally null for PUCT *solve rate*
+(ALPHAZERO_CONNECT_FOUR_FINDINGS.md) -- PUCT never creates duplicate nodes
+in the first place, so there is nothing to deduplicate. But self-play's
+training target is the root visit distribution, and under merging a node's
+visit count pools every path that reached that state, which is a
+lower-variance estimate of the same quantity at identical self-play budget.
+Whether that produces a stronger network is a separate question from
+whether it solves more puzzles at search time, and it is the question the
+expert-iteration literature says actually matters. Running the two arms to
+convergence is a real training spend, so this only supplies the switch.
 """
 
 from __future__ import annotations
@@ -61,6 +73,13 @@ def main():
     ap.add_argument("--iterations", type=int, default=10)
     ap.add_argument("--games-per-iteration", type=int, default=20)
     ap.add_argument("--selfplay-budget", type=int, default=50, help="PUCT simulations per move during self-play")
+    ap.add_argument("--selfplay-merge", action=argparse.BooleanOptionalAction, default=True,
+                    help="whether self-play search merges transpositions (default: yes, "
+                         "matching selfplay.play_game's own default and every run so far). "
+                         "--no-selfplay-merge gives the tree-keyed arm, so tree- vs "
+                         "DAG-derived training targets can be compared at matched self-play "
+                         "budget: under merging a node's visit count -- which IS the policy "
+                         "target -- pools every path that reached that state.")
     ap.add_argument("--c-puct", type=float, default=1.5)
     ap.add_argument("--temperature-moves", type=int, default=6)
     ap.add_argument("--dirichlet-alpha", type=float, default=0.5)
@@ -116,6 +135,7 @@ def main():
             examples = play_game(
                 evaluate_fn, args.selfplay_budget, args.c_puct, args.temperature_moves,
                 args.dirichlet_alpha, args.dirichlet_epsilon, rng,
+                merge_enabled=args.selfplay_merge,
             )
             buffer.add_game(examples)
 

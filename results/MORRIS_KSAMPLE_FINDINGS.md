@@ -1,0 +1,116 @@
+# K-Sampling Expansion on Morris: Partial Replication
+
+## Question
+
+`CONNECT_FOUR_KSAMPLE_FINDINGS.md` showed that removing `untried_moves`'s structural
+anti-duplicate guarantee (K independent draws with replacement instead of exactly-once tracking)
+flips Connect Four's guidance-independent null into a guidance-*dependent* merge benefit. Morris
+(`MORRIS_FINDINGS.md`) is a null for a different reason -- not a structural guarantee, but
+adversarial interleaving making it rare for two independently-chosen move sequences to land on
+the identical joint state. Does K-sampling flip Morris's null too? And does the guidance-quality
+axis replicate there as well, or is that piece specific to Connect Four?
+
+## Setup
+
+New module `classical_mcts_morris_ksample.py`, combining three properties established
+separately: Morris's two-player hero/opponent shape and cycle-safe `select()`/`run_search`
+(`classical_mcts_morris.py`) with K-independent-draws expansion and per-draw-unique baseline
+keying (`classical_mcts_ksample.py`'s pattern). `simulate()` extended with the same
+honest-vs-neutral `guidance_depth_cap` distinction Connect Four's ablation used (large
+`rollout_depth` as the honest underlying walk length; a smaller `guidance_depth_cap` cuts it
+short and returns 0.5 instead of the original unconditional 0.0-on-exhaustion).
+
+**A real edge case caught before running anything**: `select()`'s cycle-safety can still make it
+give up on an already-*expanded* node (K children exist, but every one would revisit the current
+path) -- distinct from the plain-Morris module's "never expanded" give-up case, since expansion
+here happens once in a K-batch rather than incrementally. `run_search` needed an explicit check
+for `leaf.expanded` before ever calling `expand_batch` again, or a second expansion event on the
+same node would have silently overwritten its existing K children's edges. Fixed and covered by
+`test_run_search_does_not_hang_on_a_reversible_position` before any real run.
+
+Verified: `pytest tests/test_classical_mcts_morris_ksample.py` (8 tests) + full suite
+(238 passed) green.
+
+## Results
+
+Same puzzle set as Morris's original work (k_plies 1/3/5, 15 puzzles each), K=4,
+`rollout_depth`=20, guidance cap ∈ {None, 8, 2}, budgets narrowed to 2/3/5 (Morris solves fast,
+same discipline as every prior budget search this session):
+
+| budget | guidance | baseline | treatment | diff | wilcoxon p | nodes base→treat |
+|---|---|---|---|---|---|---|
+| 2 | any | 0.189 | 0.189 | 0.000 | -- | 9.0→6.8 |
+| 3 | None (honest) | 0.189 | 0.286 | +0.097 | <0.0001 | 13.0→9.7 |
+| 3 | cap=8 | 0.189 | 0.278 | +0.089 | <0.0001 | 13.0→9.7 |
+| 3 | cap=2 | 0.189 | 0.291 | +0.102 | <0.0001 | 13.0→9.6 |
+| 5 | None (honest) | 0.189 | 0.462 | +0.273 | <0.0001 | 20.9→15.5 |
+| 5 | cap=8 | 0.189 | 0.455 | +0.266 | <0.0001 | 20.9→15.5 |
+| 5 | cap=2 | 0.189 | 0.453 | +0.264 | <0.0001 | 20.9→15.4 |
+
+By k_plies (budget=5): k=1 (already easy, baseline 0.567) shows a modest lift to ~0.67-0.69;
+**k=3 and k=5 (baseline 0.000, both stuck at the floor) show treatment reaching 0.34-0.36** --
+a real, decisive, well-powered effect, consistent across all three guidance conditions.
+
+**Part one confirms: K-sampling flips Morris's null too.** Removing the structural
+anti-duplicate guarantee produces a real, significant merge benefit here just as it did for
+Connect Four -- "expansion mechanism, not domain" holds for the core redundancy-creation claim.
+
+**Part two does not replicate: guidance quality has no visible effect on Morris's K-sample
+result.** Effect size is essentially flat across all three guidance conditions -- 0.097/0.089/0.102
+at budget=3, 0.273/0.266/0.264 at budget=5, no monotonic ordering, differences within noise --
+unlike Connect Four's clean, monotonic 0.117→0.142→0.198 progression at its own budget=3. Checked
+at the per-k_plies level too (not just the aggregate): the same flatness holds for k=1, k=3, and
+k=5 individually.
+
+## Reading
+
+An honest partial replication, not a full one, and the asymmetry is itself informative. The
+structural claim -- an expansion mechanism without a per-node anti-duplicate guarantee generates
+redundancy merging can reclaim, regardless of domain -- holds in both domains tested. The
+guidance-quality *modulation* of that redundancy, confirmed for Connect Four, does not show up
+in Morris. A plausible reason, offered as a hypothesis rather than a confirmed mechanism (no
+further ablation was run to isolate it): Morris's movement phase typically offers only 2-4 legal
+moves per position (each side has 3 pieces, only 3 empty cells ever exist), so K=4 draws with
+replacement collide often *by simple combinatorics*, fairly uniformly across the tree, regardless
+of which nodes get visited -- unlike Connect Four's 5-7-move branching, where guidance quality
+determines *which* nodes accumulate enough visits for collisions to compound. If redundancy in
+Morris is generated by raw branching-factor arithmetic rather than by where the search's
+attention wanders, guidance quality would have little left to modulate -- consistent with what
+was observed, but not independently verified here.
+
+## Follow-up: testing the branching-factor hypothesis directly
+
+Ran the same guidance-cap sweep on Connect Four's *own* K-sample module (no new code, just a
+narrowed board) at width=4/height=5 -- 4 legal moves per position at most, close to Morris's 2-4
+range, down from the original width=5 board's 5-7. Same puzzle-generation pipeline needed
+looser parameters to find any k_plies=3 forced wins at all (`max_pre_moves` 8→15; width=3 and
+width=4 with the original `max_pre_moves=8` found **zero** puzzles within 17,000 attempts --
+width=4 is the absolute minimum for any Connect Four win to exist geometrically, and forced-win
+setups there are correspondingly rarer).
+
+| budget | guidance | diff | nodes base→treat |
+|---|---|---|---|
+| 3 | None (honest) | +0.331 | 13.0→7.7 |
+| 3 | cap=8 | +0.325 | 13.0→7.7 |
+| 3 | cap=2 | +0.398 | 13.0→7.7 |
+| 5 | None (honest) | +0.699 | 21.0→11.9 |
+| 5 | cap=8 | +0.695 | 21.0→11.9 |
+| 5 | cap=2 | +0.689 | 21.0→11.9 |
+
+**A genuine gradient, not a clean confirmation.** At the narrower board, guidance-dependence is
+much weaker than the original width=5 result's clean 0.117→0.142→0.198 (a ~70% relative rise) --
+here only budget=3's most-degraded cap (cap=2: +0.398 vs. honest/cap=8's +0.325-0.331, CIs
+[0.345,0.453] vs [0.257,0.298]/[0.263,0.398], barely separated) shows any lift, and budget=5 is
+completely flat (+0.699/+0.695/+0.689, well within noise). Branching factor 5-7 (original Connect
+Four): strong, clean guidance-dependence. Branching factor ~4 (narrowed Connect Four): weak,
+borderline, budget-dependent guidance-sensitivity. Branching factor 2-4 (Morris): none. This is
+consistent with the hypothesis as a *gradient*, not as a sharp threshold -- and it's a real,
+if imperfect, partial verification rather than the untested speculation the original write-up
+left it as.
+
+## Status
+
+Closed. K-sampling's core claim generalizes past Connect Four; the guidance-dependence finding
+does not, and is reported as such rather than smoothed over. This is exactly the kind of result
+a genuine replication attempt should produce sometimes -- confirming what generalizes, exposing
+what doesn't, without forcing a clean story where the data doesn't support one.

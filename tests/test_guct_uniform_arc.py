@@ -65,10 +65,13 @@ def test_arc_heuristic_positive_when_not_matching():
     assert m._arc_heuristic(state, (target,)) == 1.0  # 0/4 matching cells
 
 
-def test_arc_heuristic_matches_is_goal_exactly_at_the_boundary():
-    # heuristic must be 0.0 if and only if is_goal is True -- checked directly,
-    # not just for one hand-picked case, since own_h's 0.0-vs-nonzero split is
-    # what run_search uses to decide is_terminal.
+def test_arc_heuristic_matches_is_goal_at_the_boundary():
+    # h == 0.0 must imply is_goal, since own_h's 0.0-vs-nonzero split is what
+    # run_search uses to decide is_terminal. The converse does not hold any
+    # more: is_goal now matches the target at ANY context index (it has to,
+    # or goal-ness would depend on information canonical_key cannot see), so
+    # a solved state can carry h > 0.0 here -- see
+    # test_make_node_forces_zero_h_on_a_goal_at_a_non_final_index.
     target = ((1, 2), (3, 4))
     solved_state = engine.ProgramState(contexts=((target,),), type_schema=(frozenset({"GRID"}),))
     unsolved_state = engine.ProgramState(contexts=(((9, 9), (9, 9)),), type_schema=(frozenset({"GRID"}),))
@@ -137,6 +140,73 @@ def test_run_search_stats_counts_new_nodes_and_merge_hits():
     stats = {}
     m.run_search(task.train_inputs, task.train_outputs, config, budget=150, rng=rng, stats=stats)
     total = stats.get("new_nodes", 0) + stats.get("merge_hits", 0)
-    assert total <= 150  # <= since real-execution failures can end the search before using full budget
+    assert total <= 150  # <= only if the whole reachable tree is exhausted first
     assert total > 0
     assert stats.get("new_nodes", 0) > 0
+
+
+def test_arc_heuristic_is_zero_exactly_when_is_goal():
+    """Both directions, restored: h reads the best context index, so it is
+    0.0 iff some index matches every target, which is exactly `is_goal`."""
+    import random
+    target = ((1, 2), (3, 4))
+    # Target present, but not as the most recent value.
+    goal_not_last = engine.ProgramState(
+        contexts=((target, 7),),
+        type_schema=(frozenset({"GRID"}), frozenset({"INTEGER"})),
+    )
+    assert engine.is_goal(goal_not_last, (target,)) is True
+    assert m._arc_heuristic(goal_not_last, (target,)) == 0.0
+    node = m._make_node(goal_not_last, (target,), m.GUCTUniformConfig(merge_enabled=True), random.Random(0))
+    assert node.is_terminal is True
+    assert node.own_h == 0.0
+
+    unsolved = engine.ProgramState(contexts=((((9, 9), (9, 9)), 7),),
+                                   type_schema=(frozenset({"GRID"}), frozenset({"INTEGER"})))
+    assert engine.is_goal(unsolved, (target,)) is False
+    assert m._arc_heuristic(unsolved, (target,)) > 0.0
+
+
+def test_arc_heuristic_is_determined_by_the_merge_key():
+    """The asymmetry this fixes: two orderings sharing a merge key must get
+    the same h, or the merge arm (which keeps whichever ordering arrived
+    first) and the tree arm score different things -- and GUCT-Uniform is
+    entirely h-driven, so that difference is not washed out by rollouts."""
+    target = ((1, 2), (3, 4))
+    near = ((1, 2), (3, 9))
+    a = engine.ProgramState(contexts=((near, 7),),
+                            type_schema=(frozenset({"GRID"}), frozenset({"INTEGER"})))
+    b = engine.ProgramState(contexts=((7, near),),
+                            type_schema=(frozenset({"INTEGER"}), frozenset({"GRID"})))
+    assert engine.canonical_key(a) == engine.canonical_key(b)
+    assert m._arc_heuristic(a, (target,)) == m._arc_heuristic(b, (target,))
+    assert 0.0 < m._arc_heuristic(a, (target,)) < 1.0
+
+
+def test_a_failed_expansion_at_a_root_with_live_children_does_not_end_the_search(monkeypatch):
+    """expand() returns None when every remaining untried move fails at
+    execution. run_search used to `break` whenever that happened at the root
+    -- even though the root still had live children to descend into -- and,
+    below the root, to close the incoming edge unconditionally, pruning the
+    leaf's existing subtree. An audit measured it stopping 23/120 tree and
+    16/120 merge runs after ~15-24 nodes at budget 500. Forced here: the
+    second expansion (at the root, which by then has one child) fails."""
+    task = _load_real_task("68b16354")
+    real = m.expand
+    calls = {"n": 0}
+
+    def flaky(graph, leaf_key, target_outputs, config, rng):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            assert leaf_key == graph.root_key and graph.nodes[leaf_key].children, "fixture premise"
+            graph.nodes[leaf_key].untried_moves.clear()  # every remaining move "failed"
+            return None
+        return real(graph, leaf_key, target_outputs, config, rng)
+
+    monkeypatch.setattr(m, "expand", flaky)
+    for merge in (False, True):
+        calls["n"] = 0
+        stats = {}
+        m.run_search(task.train_inputs, task.train_outputs, m.GUCTUniformConfig(merge_enabled=merge),
+                     budget=20, rng=random.Random(0), stats=stats)
+        assert stats.get("new_nodes", 0) + stats.get("merge_hits", 0) == 20, f"merge={merge} stopped early"

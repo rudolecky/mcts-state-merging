@@ -274,6 +274,48 @@ def parse_and_verify(
     return is_correct, {"well_formed": well_formed, "reason": "ok" if is_correct else "answer/chain mismatch"}
 
 
+def find_reconvergent_routes(
+    facts: tuple[tuple[str, str], ...], start: str
+) -> tuple[str, list[str], list[str]] | None:
+    """DFS-enumerate every simple path from `start` over `facts`. Returns
+    (entity, short_route, long_route) for the first entity reachable via
+    >=2 distinct-length paths -- a genuine, by-construction transposition:
+    two different histories reaching the identical current entity, exactly
+    the case `_build_component`'s reconverge shortcut is meant to create.
+    short_route is the fewest-hop path found, long_route the most-hop.
+    Each route is the list of entities from start to that entity, inclusive
+    (start is route[0]). Returns None if no entity has >=2 distinct lengths
+    (e.g. this instance wasn't built with reconverge=True, or start has no
+    branching at all).
+
+    Graph is small at this dataset's scale (chain_len<=5, 1-3 distractors,
+    at most one shortcut edge) so plain DFS over all simple paths is fine --
+    no memoization needed, unlike _path_count's count-only DP.
+    """
+    successors: dict[str, list[str]] = {}
+    for u, v in facts:
+        successors.setdefault(u, []).append(v)
+
+    routes_by_entity: dict[str, list[list[str]]] = {}
+
+    def dfs(node: str, path: list[str], visited: frozenset[str]) -> None:
+        for nxt in successors.get(node, []):
+            if nxt in visited:
+                continue
+            new_path = path + [nxt]
+            routes_by_entity.setdefault(nxt, []).append(new_path)
+            dfs(nxt, new_path, visited | {nxt})
+
+    dfs(start, [start], frozenset({start}))
+
+    for entity, routes in routes_by_entity.items():
+        lengths = {len(r) for r in routes}
+        if len(lengths) >= 2:
+            routes_sorted = sorted(routes, key=len)
+            return entity, routes_sorted[0], routes_sorted[-1]
+    return None
+
+
 def canonical_state_at(instance: ProsQAInstance, step_bodies_so_far: list[str]) -> str | None:
     """Ground-truth "same state" key for a snapshot taken after some prefix
     of steps within one trace -- passed to collect.py as a

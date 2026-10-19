@@ -67,6 +67,36 @@ mostly a property of the search algorithm's backup rule and of whether plain tre
 domain gets permanently trapped without it, not a fixed property of how much redundant structure a
 domain has.
 
+A later result sharpens that conclusion by splitting merging in two. Merging does two things at
+once: it makes expansions land on distinct states, and it pools the statistics of every path that
+reaches one. A third mode was added that keeps only the first, called reject mode: the search
+computes the same state key, but when an expansion lands on a state already seen anywhere it
+discards that move and tries another, keeping ordinary path based node keys so no statistics are
+ever pooled and the backup rule is left alone. On the Rubik's Cube this fixes the catastrophe
+outright, solving every puzzle at every budget and difficulty where merging solves none, and it
+beats plain tree search at the tighter budgets rather than merely matching it. On Blocksworld it
+beats merging itself at every budget, most visibly where budget is scarce. On ARC AGI it is null,
+like every other change tried on that domain. So the harm merging can do was never in
+deduplication at all, only in what the backup rule does with pooled statistics, and declining to
+pool is a third option that neither of the earlier capping mitigations approximated. The cost is
+wall clock: a rejected move still pays for the state it computed and threw away.
+
+That last sentence turned out to matter more than it first appeared. Because budget counts
+expansions and a rejected move never becomes one, reject mode was quietly performing roughly twice
+the state generations of the arm it was compared against. Charging rejections against the budget
+removes reject mode's advantage on Blocksworld entirely, and removes it under the GUCT Uniform
+backup rule on every domain. What survives is narrower and clearer: reject mode is a repair for the
+case where pooling fails catastrophically, not a general improvement on merging. On the Rubik's
+Cube under UCB1 with Monte Carlo average backup, where merging solves nothing at all, reject mode
+still solves everything within a charged budget. Everywhere pooling already works, reject mode
+merely matches it. Swapping the backup rule fixes the same failure, so the two repairs are
+alternatives rather than additions.
+
+The LLM guided harness is the exception, and for a concrete reason: there the candidate
+continuations are all generated in one batch before any reject decision is made, so declining one
+costs nothing extra. That is why the technique is attractive for the reasoning search specifically
+rather than as a general search improvement.
+
 ## Repository layout
 
 * `src/mcts_phase0/`: all search algorithms and domain engines.

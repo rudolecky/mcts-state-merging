@@ -178,7 +178,17 @@ def backup(graph: MCTSGraph, path: list[tuple], value: float) -> None:
             parent.children[move].n_edge += 1
 
 
-def run_search(start_state: tuple, config: ClassicalMCTSConfig, budget: int, rollout_depth: int, rng: random.Random) -> MCTSGraph:
+def run_search(start_state: tuple, config: ClassicalMCTSConfig, budget: int, rollout_depth: int, rng: random.Random,
+               stop_on_solve: bool = False) -> MCTSGraph:
+    """`stop_on_solve` returns the graph as soon as an expansion first
+    reaches the goal, instead of running the remaining budget out. Off by
+    default (every published experiment measured solve rate, which this
+    cannot change, since budget is spent only on expansions). It exists for
+    graph-structure analysis: once a terminal node exists, the loop keeps
+    re-selecting it and backing up 1.0 along the solution path without
+    consuming any expansion budget, so visit counts on that path inflate by
+    orders of magnitude and any post-hoc statistic involving n_visits
+    becomes an artifact of how long the loop span afterwards."""
     graph = create_root(start_state, config.merge_enabled)
     expansions_used = 0
     iterations = 0
@@ -200,6 +210,8 @@ def run_search(start_state: tuple, config: ClassicalMCTSConfig, budget: int, rol
         child = graph.nodes[child_key]
         value = child.terminal_value if child.is_terminal else _leaf_value(child.state, rollout_depth, config, rng)
         backup(graph, path, value)
+        if stop_on_solve and child.is_terminal and child.terminal_value == 1.0:
+            break
     return graph
 
 

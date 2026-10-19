@@ -36,7 +36,18 @@ def _stats(rows, key_a, key_b):
     return diffs.mean(), ci, p
 
 
-def run_puzzle_tier(target_distance, budgets, n_puzzles, repeats, distances, width=3, height=3, seed=0):
+def run_puzzle_tier(target_distance, budgets, n_puzzles, repeats, distances, width=3, height=3, seed=0, reject=False,
+                    charge=False):
+    """`reject` adds a third arm and reports it against merging.
+
+    Falsification test, not exploration. On Blocksworld the filter beat
+    pooling even under this backup rule, and the account given
+    (results/GUCT_UNIFORM_REJECT_CROSSING_FINDINGS.md) was that the backup
+    rule stops pooled statistics destroying the search while the filter
+    separately recovers budget wasted re-deriving duplicates. That predicts
+    a NULL on this domain, where GUCT-Uniform already brought merge and
+    tree to parity -- no budget gap is left for a filter to widen. A win
+    here would refute the account."""
     puzzles = spe.generate_puzzles(n=n_puzzles, seed=seed, width=width, height=height,
                                     target_distance=target_distance, distances=distances)
     tier = {"domain": "8-puzzle", "target_distance": target_distance, "budgets": []}
@@ -44,7 +55,7 @@ def run_puzzle_tier(target_distance, budgets, n_puzzles, repeats, distances, wid
         t0 = time.time()
         rows = []
         for i, inst in enumerate(puzzles):
-            tree_solved = merge_solved = 0
+            tree_solved = merge_solved = reject_solved = 0
             tree_nodes = merge_nodes = 0
             for r in range(repeats):
                 rng = random.Random(i * 100003 + r)
@@ -55,7 +66,12 @@ def run_puzzle_tier(target_distance, budgets, n_puzzles, repeats, distances, wid
                 g2 = gup.run_search(inst.start_state, width, height, gup.GUCTUniformConfig(merge_enabled=True), budget, rng2, distances)
                 merge_solved += int(gup.is_solved(g2))
                 merge_nodes += len(g2.nodes)
+                if reject:
+                    rng3 = random.Random(i * 100003 + r)
+                    g3 = gup.run_search(inst.start_state, width, height, gup.GUCTUniformConfig(merge_enabled=False, reject_duplicates=True, charge_rejections=charge), budget, rng3, distances)
+                    reject_solved += int(gup.is_solved(g3))
             rows.append({"id": inst.id, "tree": tree_solved / repeats, "merge": merge_solved / repeats,
+                         "reject": reject_solved / repeats,
                          "tree_nodes": tree_nodes / repeats, "merge_nodes": merge_nodes / repeats})
         tm = np.mean([r["tree"] for r in rows])
         mm = np.mean([r["merge"] for r in rows])
@@ -65,19 +81,36 @@ def run_puzzle_tier(target_distance, budgets, n_puzzles, repeats, distances, wid
         elapsed = time.time() - t0
         print(f"  8-puzzle td={target_distance} budget={budget}: tree={tm:.3f} merge={mm:.3f} diff={dm:.3f} "
               f"CI=[{ci[0]:.3f},{ci[1]:.3f}] p={p:.4f} nodes tree={tn:.1f} merge={mn:.1f} (t={elapsed:.1f}s)")
-        tier["budgets"].append({"budget": budget, "tree": tm, "merge": mm, "diff": dm, "ci": ci, "p": p,
-                                 "tree_nodes": tn, "merge_nodes": mn})
+        entry = {"budget": budget, "tree": tm, "merge": mm, "diff": dm, "ci": ci, "p": p,
+                 "tree_nodes": tn, "merge_nodes": mn}
+        if reject:
+            jm = np.mean([r["reject"] for r in rows])
+            dj, cij, pj = _stats(rows, "merge", "reject")
+            print(f"  8-puzzle td={target_distance} budget={budget}: reject={jm:.3f} "
+                  f"reject_minus_merge={dj:.3f} CI=[{cij[0]:.3f},{cij[1]:.3f}] p={pj:.4f}")
+            entry.update({"reject": jm, "reject_minus_merge": dj, "reject_ci": cij, "reject_p": pj})
+        tier["budgets"].append(entry)
     return tier
 
 
-def run_sokoban_tier(target_distance, budgets, n_puzzles, repeats, distances, seed=0):
+def run_sokoban_tier(target_distance, budgets, n_puzzles, repeats, distances, seed=0, reject=False, charge=False):
+    """`reject` adds a third arm and reports it against merging.
+
+    Falsification test, not exploration. On Blocksworld the filter beat
+    pooling even under this backup rule, and the account given
+    (results/GUCT_UNIFORM_REJECT_CROSSING_FINDINGS.md) was that the backup
+    rule stops pooled statistics destroying the search while the filter
+    separately recovers budget wasted re-deriving duplicates. That predicts
+    a NULL on this domain, where GUCT-Uniform already brought merge and
+    tree to parity -- no budget gap is left for a filter to widen. A win
+    here would refute the account."""
     puzzles = se.generate_puzzles(n=n_puzzles, seed=seed, target_distance=target_distance, distances=distances)
     tier = {"domain": "sokoban", "target_distance": target_distance, "budgets": []}
     for budget in budgets:
         t0 = time.time()
         rows = []
         for i, inst in enumerate(puzzles):
-            tree_solved = merge_solved = 0
+            tree_solved = merge_solved = reject_solved = 0
             tree_nodes = merge_nodes = 0
             for r in range(repeats):
                 rng = random.Random(i * 100003 + r)
@@ -88,7 +121,12 @@ def run_sokoban_tier(target_distance, budgets, n_puzzles, repeats, distances, se
                 g2 = gus.run_search(inst.start_state, gus.GUCTUniformConfig(merge_enabled=True), budget, rng2, distances)
                 merge_solved += int(gus.is_solved(g2))
                 merge_nodes += len(g2.nodes)
+                if reject:
+                    rng3 = random.Random(i * 100003 + r)
+                    g3 = gus.run_search(inst.start_state, gus.GUCTUniformConfig(merge_enabled=False, reject_duplicates=True, charge_rejections=charge), budget, rng3, distances)
+                    reject_solved += int(gus.is_solved(g3))
             rows.append({"id": inst.id, "tree": tree_solved / repeats, "merge": merge_solved / repeats,
+                         "reject": reject_solved / repeats,
                          "tree_nodes": tree_nodes / repeats, "merge_nodes": merge_nodes / repeats})
         tm = np.mean([r["tree"] for r in rows])
         mm = np.mean([r["merge"] for r in rows])
@@ -98,8 +136,15 @@ def run_sokoban_tier(target_distance, budgets, n_puzzles, repeats, distances, se
         elapsed = time.time() - t0
         print(f"  sokoban td={target_distance} budget={budget}: tree={tm:.3f} merge={mm:.3f} diff={dm:.3f} "
               f"CI=[{ci[0]:.3f},{ci[1]:.3f}] p={p:.4f} nodes tree={tn:.1f} merge={mn:.1f} (t={elapsed:.1f}s)")
-        tier["budgets"].append({"budget": budget, "tree": tm, "merge": mm, "diff": dm, "ci": ci, "p": p,
-                                 "tree_nodes": tn, "merge_nodes": mn})
+        entry = {"budget": budget, "tree": tm, "merge": mm, "diff": dm, "ci": ci, "p": p,
+                 "tree_nodes": tn, "merge_nodes": mn}
+        if reject:
+            jm = np.mean([r["reject"] for r in rows])
+            dj, cij, pj = _stats(rows, "merge", "reject")
+            print(f"  sokoban td={target_distance} budget={budget}: reject={jm:.3f} "
+                  f"reject_minus_merge={dj:.3f} CI=[{cij[0]:.3f},{cij[1]:.3f}] p={pj:.4f}")
+            entry.update({"reject": jm, "reject_minus_merge": dj, "reject_ci": cij, "reject_p": pj})
+        tier["budgets"].append(entry)
     return tier
 
 
@@ -109,6 +154,11 @@ def main():
     ap = argparse.ArgumentParser(description="8-puzzle + Sokoban under GUCT-Uniform: does merge/tree solve-rate parity generalize?")
     ap.add_argument("--n-puzzles", type=int, default=8)
     ap.add_argument("--repeats", type=int, default=30)
+    ap.add_argument("--reject", action="store_true",
+                    help="also run the reject-duplicates arm and report it against merging. "
+                         "Falsification test for the Blocksworld crossing -- a null is predicted.")
+    ap.add_argument("--charge-rejections", action="store_true",
+                    help="charge each rejected move against the budget (a rejection still costs a real state generation). Required for any filter-vs-merge comparison at matched compute; off by default only so previously recorded uncharged runs stay reproducible.")
     ap.add_argument("--output", default="results/guct_uniform_generalization_experiment.json")
     args = ap.parse_args()
 
@@ -117,13 +167,13 @@ def main():
 
     all_results = []
     print("=== 8-PUZZLE GUCT-UNIFORM, td=8 ===")
-    all_results.append(run_puzzle_tier(8, [15, 20, 25, 30], args.n_puzzles, args.repeats, puzzle_dist))
+    all_results.append(run_puzzle_tier(8, [15, 20, 25, 30], args.n_puzzles, args.repeats, puzzle_dist, reject=args.reject, charge=args.charge_rejections))
     print("=== 8-PUZZLE GUCT-UNIFORM, td=12 ===")
-    all_results.append(run_puzzle_tier(12, [35, 40, 45, 50], args.n_puzzles, args.repeats, puzzle_dist))
+    all_results.append(run_puzzle_tier(12, [35, 40, 45, 50], args.n_puzzles, args.repeats, puzzle_dist, reject=args.reject, charge=args.charge_rejections))
     print("=== SOKOBAN GUCT-UNIFORM, td=6 ===")
-    all_results.append(run_sokoban_tier(6, [15, 20, 25, 30], args.n_puzzles, args.repeats, sokoban_dist))
+    all_results.append(run_sokoban_tier(6, [15, 20, 25, 30], args.n_puzzles, args.repeats, sokoban_dist, reject=args.reject, charge=args.charge_rejections))
     print("=== SOKOBAN GUCT-UNIFORM, td=8 ===")
-    all_results.append(run_sokoban_tier(8, [20, 25, 30, 40], args.n_puzzles, args.repeats, sokoban_dist))
+    all_results.append(run_sokoban_tier(8, [20, 25, 30, 40], args.n_puzzles, args.repeats, sokoban_dist, reject=args.reject, charge=args.charge_rejections))
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -3,6 +3,7 @@ from mcts_phase0.datasets.prosqa import (
     _path_count,
     average_path_count,
     canonical_state_at,
+    find_reconvergent_routes,
     generate_dataset,
     parse_and_verify,
 )
@@ -190,3 +191,59 @@ def test_canonical_state_at_none_on_non_contiguous_jump():
 def test_canonical_state_at_none_after_an_already_bad_step():
     inst = _reconverging_instance()
     assert canonical_state_at(inst, ["a is a zzz", "a is a b"]) is None
+
+
+# ---------- find_reconvergent_routes ----------
+
+def test_find_reconvergent_routes_finds_the_shortcut():
+    facts = (("a", "b"), ("b", "c"), ("c", "d"), ("a", "c"))
+    result = find_reconvergent_routes(facts, "a")
+    assert result is not None
+    entity, short_route, long_route = result
+    assert entity == "c"
+    assert short_route == ["a", "c"]
+    assert long_route == ["a", "b", "c"]
+
+
+def test_find_reconvergent_routes_none_on_plain_chain():
+    facts = (("a", "b"), ("b", "c"), ("c", "d"))
+    assert find_reconvergent_routes(facts, "a") is None
+
+
+def test_find_reconvergent_routes_none_with_only_dead_end_distractors():
+    # a distractor branch adds a second entity but never reconverges with
+    # the main chain -- no entity should have two distinct-length routes.
+    facts = (("a", "b"), ("b", "c"), ("b", "x"))  # x is a dead end off b
+    assert find_reconvergent_routes(facts, "a") is None
+
+
+def test_find_reconvergent_routes_with_shortcut_landing_further_down_the_chain():
+    # shortcut lands 3 hops in (at "d"), plus an unrelated distractor off "b" --
+    # mirrors _build_component's j=randint(2, chain_len) landing anywhere, and
+    # confirms distractors don't confuse the search.
+    facts = (
+        ("a", "b"), ("b", "c"), ("c", "d"), ("d", "e"),
+        ("a", "d"),  # shortcut: a->d directly, 3 hops shorter than a-b-c-d
+        ("b", "x"),  # dead-end distractor off b
+    )
+    entity, short_route, long_route = find_reconvergent_routes(facts, "a")
+    assert entity == "d"
+    assert short_route == ["a", "d"]
+    assert long_route == ["a", "b", "c", "d"]
+
+
+def test_find_reconvergent_routes_matches_generated_reconverging_instances():
+    # Real generator output, not just hand-built fixtures: every instance
+    # with path_count >= 2 (a real reconverge=True draw) must yield a hit,
+    # and both routes must reach the instance's own target's ancestor chain
+    # consistently (start of both routes is always `start`).
+    instances = generate_dataset(n_positive=60, n_negative=0, seed=13, reconverge_fraction=0.6)
+    reconverging = [i for i in instances if i.path_count >= 2]
+    assert reconverging  # sanity: the seed/fraction actually produced some
+    for inst in reconverging:
+        result = find_reconvergent_routes(inst.facts, inst.start)
+        assert result is not None, f"expected a reconvergence for {inst.id}"
+        entity, short_route, long_route = result
+        assert short_route[0] == long_route[0] == inst.start
+        assert short_route[-1] == long_route[-1] == entity
+        assert len(short_route) < len(long_route)

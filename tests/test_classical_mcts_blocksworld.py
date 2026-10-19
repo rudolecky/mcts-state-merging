@@ -251,3 +251,55 @@ def test_run_search_heuristic_mode_never_calls_simulate(monkeypatch):
     config = ClassicalMCTSConfig(merge_enabled=True, value_source="heuristic")
     graph = run_search(_START_3, goal, task, config, budget=100, rollout_depth=15, rng=rng, heuristic=heuristic)
     assert is_solved(graph)  # a trivial 3-block puzzle should solve easily under real guidance
+
+
+# ---------- reject-duplicates arm (admission filter, no statistic pooling) ----------
+
+def test_reject_duplicates_keeps_states_unique_and_never_pools():
+    task = make_task(3)
+    goal = goal_state(3)
+    config = ClassicalMCTSConfig(merge_enabled=False, reject_duplicates=True)
+    graph = run_search(_START_3, goal, task, config, budget=100, rollout_depth=15, rng=random.Random(0))
+
+    assert graph.merge_hits == 0  # path keys are unique by construction
+    assert graph.rejected > 0  # Blocksworld is dense in transpositions, so the filter must fire
+
+    # Exactly one incoming edge per node: still a tree, no aggregation.
+    in_degree = {}
+    for node in graph.nodes.values():
+        for edge in node.children.values():
+            in_degree[edge.child_key] = in_degree.get(edge.child_key, 0) + 1
+    assert all(d == 1 for d in in_degree.values())
+
+    # Every node holds a distinct state -- the property the arm buys.
+    states = [n.state for n in graph.nodes.values()]
+    assert len(set(states)) == len(states)
+
+
+def test_reject_duplicates_returns_none_when_every_move_is_a_duplicate():
+    """Expansion has to be able to fail in this arm, and the caller has to
+    survive it -- otherwise a fully-transposing leaf crashes the search."""
+    task = make_task(3)
+    goal = goal_state(3)
+    config = ClassicalMCTSConfig(merge_enabled=False, reject_duplicates=True)
+    graph = create_root(_START_3, goal, task, merge_enabled=False, reject_duplicates=True)
+    from mcts_phase0.datasets.blocksworld_engine import apply_move as bw_apply
+    root = graph.nodes[graph.root_key]
+    # Pre-seed every reachable child state as already seen.
+    for op in list(root.untried_moves):
+        graph.seen_states.add(bw_apply(root.state, op))
+    assert expand(graph, graph.root_key, [], goal, task, config, random.Random(0)) is None
+    assert root.untried_moves == []
+
+
+def test_reject_duplicates_still_solves_a_small_puzzle():
+    task = make_task(3)
+    goal = goal_state(3)
+    solved_count = 0
+    trials = 20
+    for seed in range(trials):
+        config = ClassicalMCTSConfig(merge_enabled=False, reject_duplicates=True)
+        graph = run_search(_START_3, goal, task, config, budget=100, rollout_depth=15, rng=random.Random(seed))
+        if is_solved(graph):
+            solved_count += 1
+    assert solved_count >= trials * 0.7

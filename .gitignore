@@ -10,5 +10,15 @@ wheels/
 .venv
 
 # Experiment outputs (raw hidden-state pickles are large; regenerate via collect.py)
-results/
+# `results/*` rather than `results/`: git will not descend into an excluded
+# DIRECTORY, so a negation under `results/` silently does nothing. Excluding the
+# directory's contents instead lets the negation below actually apply. Verified
+# with `git check-ignore` rather than assumed -- the first attempt at this looked
+# correct and did not work.
+results/*
+# The written findings are the research record, not an output. Kept in git (480K of
+# markdown) so conclusions, retractions and corrections are reviewable and cannot be
+# lost along with the regenerable data in the same directory. Subdirectories stay
+# excluded, so pickles and checkpoint shards are still ignored.
+!results/*.md
 .pytest_cache/
