@@ -230,6 +230,16 @@ def run_search(
         nodes_before = len(graph.nodes)
         expanded = expand(graph, path[-1], target_outputs, config, rng)
         if expanded is None:
+            # Every remaining untried move failed at execution. That ends
+            # this leaf's *expansion*, not its usefulness: if it already has
+            # a live child edge, selection can descend into it next
+            # iteration. Closing the edge (or, at the root, ending the
+            # search) only when nothing live is left mirrors the other GUCT
+            # ports' reject-arm fix -- "produced nothing new" is not "leads
+            # nowhere". Doing it unconditionally stopped ~1 in 6 runs early.
+            leaf_node = graph.nodes[path[-1]]
+            if any(not e.closed for e in leaf_node.children.values()):
+                continue
             if len(path) == 1:
                 break
             parent = graph.nodes[path[-2]]

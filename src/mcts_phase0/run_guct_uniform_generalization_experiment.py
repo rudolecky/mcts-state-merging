@@ -36,7 +36,8 @@ def _stats(rows, key_a, key_b):
     return diffs.mean(), ci, p
 
 
-def run_puzzle_tier(target_distance, budgets, n_puzzles, repeats, distances, width=3, height=3, seed=0, reject=False):
+def run_puzzle_tier(target_distance, budgets, n_puzzles, repeats, distances, width=3, height=3, seed=0, reject=False,
+                    charge=False):
     """`reject` adds a third arm and reports it against merging.
 
     Falsification test, not exploration. On Blocksworld the filter beat
@@ -67,7 +68,7 @@ def run_puzzle_tier(target_distance, budgets, n_puzzles, repeats, distances, wid
                 merge_nodes += len(g2.nodes)
                 if reject:
                     rng3 = random.Random(i * 100003 + r)
-                    g3 = gup.run_search(inst.start_state, width, height, gup.GUCTUniformConfig(merge_enabled=False, reject_duplicates=True), budget, rng3, distances)
+                    g3 = gup.run_search(inst.start_state, width, height, gup.GUCTUniformConfig(merge_enabled=False, reject_duplicates=True, charge_rejections=charge), budget, rng3, distances)
                     reject_solved += int(gup.is_solved(g3))
             rows.append({"id": inst.id, "tree": tree_solved / repeats, "merge": merge_solved / repeats,
                          "reject": reject_solved / repeats,
@@ -92,7 +93,7 @@ def run_puzzle_tier(target_distance, budgets, n_puzzles, repeats, distances, wid
     return tier
 
 
-def run_sokoban_tier(target_distance, budgets, n_puzzles, repeats, distances, seed=0, reject=False):
+def run_sokoban_tier(target_distance, budgets, n_puzzles, repeats, distances, seed=0, reject=False, charge=False):
     """`reject` adds a third arm and reports it against merging.
 
     Falsification test, not exploration. On Blocksworld the filter beat
@@ -122,7 +123,7 @@ def run_sokoban_tier(target_distance, budgets, n_puzzles, repeats, distances, se
                 merge_nodes += len(g2.nodes)
                 if reject:
                     rng3 = random.Random(i * 100003 + r)
-                    g3 = gus.run_search(inst.start_state, gus.GUCTUniformConfig(merge_enabled=False, reject_duplicates=True), budget, rng3, distances)
+                    g3 = gus.run_search(inst.start_state, gus.GUCTUniformConfig(merge_enabled=False, reject_duplicates=True, charge_rejections=charge), budget, rng3, distances)
                     reject_solved += int(gus.is_solved(g3))
             rows.append({"id": inst.id, "tree": tree_solved / repeats, "merge": merge_solved / repeats,
                          "reject": reject_solved / repeats,
@@ -156,6 +157,8 @@ def main():
     ap.add_argument("--reject", action="store_true",
                     help="also run the reject-duplicates arm and report it against merging. "
                          "Falsification test for the Blocksworld crossing -- a null is predicted.")
+    ap.add_argument("--charge-rejections", action="store_true",
+                    help="charge each rejected move against the budget (a rejection still costs a real state generation). Required for any filter-vs-merge comparison at matched compute; off by default only so previously recorded uncharged runs stay reproducible.")
     ap.add_argument("--output", default="results/guct_uniform_generalization_experiment.json")
     args = ap.parse_args()
 
@@ -164,13 +167,13 @@ def main():
 
     all_results = []
     print("=== 8-PUZZLE GUCT-UNIFORM, td=8 ===")
-    all_results.append(run_puzzle_tier(8, [15, 20, 25, 30], args.n_puzzles, args.repeats, puzzle_dist, reject=args.reject))
+    all_results.append(run_puzzle_tier(8, [15, 20, 25, 30], args.n_puzzles, args.repeats, puzzle_dist, reject=args.reject, charge=args.charge_rejections))
     print("=== 8-PUZZLE GUCT-UNIFORM, td=12 ===")
-    all_results.append(run_puzzle_tier(12, [35, 40, 45, 50], args.n_puzzles, args.repeats, puzzle_dist, reject=args.reject))
+    all_results.append(run_puzzle_tier(12, [35, 40, 45, 50], args.n_puzzles, args.repeats, puzzle_dist, reject=args.reject, charge=args.charge_rejections))
     print("=== SOKOBAN GUCT-UNIFORM, td=6 ===")
-    all_results.append(run_sokoban_tier(6, [15, 20, 25, 30], args.n_puzzles, args.repeats, sokoban_dist, reject=args.reject))
+    all_results.append(run_sokoban_tier(6, [15, 20, 25, 30], args.n_puzzles, args.repeats, sokoban_dist, reject=args.reject, charge=args.charge_rejections))
     print("=== SOKOBAN GUCT-UNIFORM, td=8 ===")
-    all_results.append(run_sokoban_tier(8, [20, 25, 30, 40], args.n_puzzles, args.repeats, sokoban_dist, reject=args.reject))
+    all_results.append(run_sokoban_tier(8, [20, 25, 30, 40], args.n_puzzles, args.repeats, sokoban_dist, reject=args.reject, charge=args.charge_rejections))
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

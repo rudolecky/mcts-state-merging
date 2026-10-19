@@ -140,7 +140,7 @@ def test_run_search_stats_counts_new_nodes_and_merge_hits():
     stats = {}
     m.run_search(task.train_inputs, task.train_outputs, config, budget=150, rng=rng, stats=stats)
     total = stats.get("new_nodes", 0) + stats.get("merge_hits", 0)
-    assert total <= 150  # <= since real-execution failures can end the search before using full budget
+    assert total <= 150  # <= only if the whole reachable tree is exhausted first
     assert total > 0
     assert stats.get("new_nodes", 0) > 0
 
@@ -181,3 +181,32 @@ def test_arc_heuristic_is_determined_by_the_merge_key():
     assert engine.canonical_key(a) == engine.canonical_key(b)
     assert m._arc_heuristic(a, (target,)) == m._arc_heuristic(b, (target,))
     assert 0.0 < m._arc_heuristic(a, (target,)) < 1.0
+
+
+def test_a_failed_expansion_at_a_root_with_live_children_does_not_end_the_search(monkeypatch):
+    """expand() returns None when every remaining untried move fails at
+    execution. run_search used to `break` whenever that happened at the root
+    -- even though the root still had live children to descend into -- and,
+    below the root, to close the incoming edge unconditionally, pruning the
+    leaf's existing subtree. An audit measured it stopping 23/120 tree and
+    16/120 merge runs after ~15-24 nodes at budget 500. Forced here: the
+    second expansion (at the root, which by then has one child) fails."""
+    task = _load_real_task("68b16354")
+    real = m.expand
+    calls = {"n": 0}
+
+    def flaky(graph, leaf_key, target_outputs, config, rng):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            assert leaf_key == graph.root_key and graph.nodes[leaf_key].children, "fixture premise"
+            graph.nodes[leaf_key].untried_moves.clear()  # every remaining move "failed"
+            return None
+        return real(graph, leaf_key, target_outputs, config, rng)
+
+    monkeypatch.setattr(m, "expand", flaky)
+    for merge in (False, True):
+        calls["n"] = 0
+        stats = {}
+        m.run_search(task.train_inputs, task.train_outputs, m.GUCTUniformConfig(merge_enabled=merge),
+                     budget=20, rng=random.Random(0), stats=stats)
+        assert stats.get("new_nodes", 0) + stats.get("merge_hits", 0) == 20, f"merge={merge} stopped early"

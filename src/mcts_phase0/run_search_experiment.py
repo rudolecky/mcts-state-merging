@@ -46,7 +46,7 @@ def load_training_records(path: str, dataset: str):
 # `--arms` changes -- so adding a fourth arm to a finished three-arm run costs
 # only the fourth arm.
 
-_ROW_SCHEMA = 1
+_ROW_SCHEMA = 2
 """Bumped whenever the per-arm row's key set changes. `load_arm` treats a row
 from a different schema as absent, so a stale shard is recomputed instead of
 crashing the summary after the results file has already been written."""
@@ -70,6 +70,7 @@ def arm_row(graph, elapsed_sec: float, K: int) -> dict:
         # budget. Recording both makes the matched-budget claim checkable.
         "expansions_used": graph.expansions_used,
         "llm_samples": graph.expansions_used * K,
+        "widenings": getattr(graph, "widenings", 0),
         "elapsed_sec": elapsed_sec,
         "graph": graph,
     }
@@ -252,6 +253,9 @@ _ARM_KWARGS = {
     "treatment": {"merge_enabled": True},
     "reject": {"merge_enabled": False, "reject_duplicates": True},
     "reject_all": {"merge_enabled": False, "reject_duplicates": True, "reject_answer_nodes": True},
+    # Control for the filter: drops step candidates at random at --random-reject-rate,
+    # no equivalence relation. Its rate is injected at config time (see main).
+    "random_reject": {"merge_enabled": False},
 }
 
 
@@ -315,8 +319,29 @@ def main():
              "projection's word); reject_all = the same filter applied to answers too, which is "
              "the variant symmetric with merge.",
     )
+    ap.add_argument(
+        "--widen-on-starvation", action="store_true",
+        help="when no unexpanded step node exists anywhere, re-sample at the selected node and "
+             "charge it as an expansion instead of spinning on terminals with budget unspent. "
+             "Fires only on an empty frontier, so non-starving runs are unchanged.",
+    )
+    ap.add_argument("--stop-on-solve", action="store_true",
+                    help="end a search once a verified-correct answer exists (cannot change solved)")
+    ap.add_argument("--random-reject-rate", type=float, default=0.0,
+                    help="probability the random_reject arm discards a step candidate; match it to "
+                         "the filter arm's realized rejection rate")
     ap.add_argument("--output-dir", default="results/search_experiment")
     args = ap.parse_args()
+    if "random_reject" in args.arms and not args.random_reject_rate:
+        raise SystemExit("--arms includes random_reject but --random-reject-rate is 0; "
+                         "that arm would be an exact copy of baseline")
+    if not 0.0 <= args.random_reject_rate <= 1.0:
+        raise SystemExit("--random-reject-rate must be in [0, 1]")
+    if "random_reject" in args.arms and not args.widen_on_starvation:
+        # Without widening, a root whose K step candidates are all rejected
+        # (probability rate**K, ~13% at 0.6 and K=4) ends the search after one
+        # expansion -- something the filter cannot do on its first expansion.
+        raise SystemExit("random_reject requires --widen-on-starvation")
 
     ds = {"countdown": countdown, "prosqa": prosqa, "connect_four": connect_four, "gsm8k": gsm8k}[args.dataset]
 
@@ -418,9 +443,10 @@ def main():
             # sequentially would otherwise consume one stream in order --
             # meaning adding an arm changes the draws every later arm sees,
             # and no arm can be re-run without re-running the whole set --
-            # and (b) seeding per arm pairs them on the same LM draws, which
-            # is what the McNemar test in analyze_search_experiment.py
-            # assumes it is getting.
+            # and (b) each arm is reproducible on its own. The arm's name IS
+            # in the seed, so arms do NOT share LM draws -- measured: root
+            # expansions differ in 10/10 published Countdown problems. The
+            # McNemar test pairs by problem, which is what it needs.
             torch.manual_seed(
                 int(hashlib.sha256(f"{args.held_out_seed}|{inst.id}|{condition}".encode()).hexdigest()[:8], 16)
             )
@@ -429,6 +455,8 @@ def main():
                 c_puct=args.c_puct, projection=fp, tau=args.tau,
                 value_source=args.value_source, num_rollouts=args.num_rollouts,
                 rollout_max_new_tokens=args.rollout_max_new_tokens,
+                widen_on_starvation=args.widen_on_starvation, stop_on_solve=args.stop_on_solve,
+                random_reject_rate=args.random_reject_rate if condition == "random_reject" else 0.0,
                 **_ARM_KWARGS[condition],
             )
             t0 = time.time()
@@ -452,9 +480,10 @@ def main():
         secs = sum(r[condition]["elapsed_sec"] for r in results) / max(len(results), 1)
         merged = sum(r[condition]["merge_hits"] for r in results)
         dropped = sum(r[condition]["rejected"] for r in results)
-        print(f"{condition:11s} solved: {solved}/{len(results)}  nodes/problem={nodes:.1f}  "
+        widened = sum(r[condition].get("widenings", 0) for r in results)
+        print(f"{condition:13s} solved: {solved}/{len(results)}  nodes/problem={nodes:.1f}  "
               f"expansions/problem={exps:.1f}  llm_samples/problem={samples:.0f}  "
-              f"sec/problem={secs:.1f}  merge_hits={merged}  rejected={dropped}")
+              f"sec/problem={secs:.1f}  merge_hits={merged}  rejected={dropped}  widenings={widened}")
     print(f"total time: {elapsed_total:.1f}s -> {out_path}")
     print(f"(the {partial_dir} checkpoint is kept; delete it to force a full recompute, "
           f"or leave it to add another arm cheaply)")

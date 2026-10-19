@@ -19,6 +19,7 @@ per function (see the approved plan for the reasoning):
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass, field
 
@@ -83,6 +84,7 @@ class SearchGraph:
     """Expansions `run_search` actually spent. Recorded because it is not
     always equal to the budget: the loop can exit on its iteration cap
     instead, whenever a terminal leaf dominates PUCT in a narrow tree."""
+    widenings: int = 0  # expansions spent re-sampling an already-expanded node, see widen_on_starvation
     _next_id: int = 1
 
     def new_node_id(self) -> int:
@@ -142,6 +144,40 @@ class SearchConfig:
     are worth running: the difference between them measures exactly how
     much the equivalence relation costs when it is allowed to overrule a
     verifier."""
+    widen_on_starvation: bool = False
+    """Spend the budget a starved search would otherwise leave unspent.
+
+    A search starves when no unexpanded step node exists anywhere: every leaf
+    selection can only reach a terminal (or a fully filtered node), so the
+    loop spins on terminals until `max_iterations` with budget left.
+    Deduplication produces that state and plain search rarely does --
+    measured, it was the cause of every unsolved run that stopped short in
+    the published LLM runs (41/41), and it made the deduplicating arms run
+    on ~60% of the baseline's LLM samples (results/THIRD_MODEL_BUDGET_LEAK_FINDINGS.md).
+
+    When set, a starved iteration instead re-samples K fresh candidates at
+    the deepest non-answer node below `max_depth` on the path the search just
+    selected, and charges that as an expansion. It fires when the frontier is
+    empty, and also past the old 10 x budget iteration cap (where a run used
+    to end with budget unspent while PUCT declined a reachable frontier). A
+    run that neither starves nor reaches that cap behaves exactly as with
+    this off. Default False so previously recorded runs stay reproducible."""
+    stop_on_solve: bool = False
+    """End the search as soon as a verified-correct answer exists. Cannot
+    change `is_solved` (an answer, once verified, stays); it only stops a
+    solved search spending iterations it no longer needs, so
+    `expansions_used` reads as cost-to-solve."""
+    random_reject_rate: float = 0.0
+    """Random-rejection control. Each *step* candidate (answers exempt, as in
+    the filter) is discarded with this probability, regardless of any
+    equivalence relation. Matched to the filter's realized rejection rate it
+    separates the filter's two possible effects: deduplication (dropping
+    candidates that ARE equivalent to something kept) versus forced depth
+    (dropping candidates at all, which concentrates the budget). The draw is
+    a hash of the candidate's tokens, the expansion counter and its index in
+    the batch -- deterministic, no shared RNG state, and two identical draws
+    in one batch are decided independently. A discarded candidate's prior
+    share is dropped, as for a dead candidate."""
     max_depth: int = 6
     value_source: str = "projection"  # "projection" | "rollout" -- see C6 ablation, guide_value is what this controls
     num_rollouts: int = 4
@@ -150,6 +186,13 @@ class SearchConfig:
     def __post_init__(self) -> None:
         if self.merge_enabled and self.reject_duplicates:
             raise ValueError("reject_duplicates is only meaningful with merge_enabled=False")
+        if not 0.0 <= self.random_reject_rate <= 1.0:
+            raise ValueError("random_reject_rate must be in [0, 1]")
+        if self.random_reject_rate and (self.merge_enabled or self.reject_duplicates):
+            # A control for the filter, run on the plain tree. Stacked on a
+            # relation it would measure neither.
+            raise ValueError("random_reject_rate is a control on the plain tree; "
+                             "it cannot be combined with merge_enabled or reject_duplicates")
 
 
 def create_root(prompt_ids: torch.Tensor, prompt_len: int) -> SearchGraph:
@@ -224,7 +267,7 @@ def expand_node(lm, graph: SearchGraph, node_id: int, instance, verifier_fn, con
     layer_idx_map = _resolve_layer_indices(lm.num_hidden_layers)
 
     any_alive = False
-    for full_ids in candidates:
+    for cand_idx, full_ids in enumerate(candidates):
         step_boundaries = find_step_boundaries(lm.tokenizer, graph.problem_prompt_len, full_ids)
         answer_idx = find_answer_boundary(lm.tokenizer, graph.problem_prompt_len, full_ids)
         new_step_idx = step_boundaries[parent.depth] if len(step_boundaries) > parent.depth else None
@@ -241,6 +284,11 @@ def expand_node(lm, graph: SearchGraph, node_id: int, instance, verifier_fn, con
             continue
 
         child_full_ids = full_ids[: boundary_idx + 1]
+        if new_kind == "step" and config.random_reject_rate and _random_reject(
+                child_full_ids, graph.expansions_used, cand_idx, config.random_reject_rate):
+            graph.rejected += 1
+            any_alive = True  # as in the filter: the expansion did work, the parent is not exhausted
+            continue
         hidden = hidden_states_for_sequence(lm, child_full_ids)
         hidden_vecs = {
             name: hidden[idx][0, boundary_idx, :].float().cpu().numpy()
@@ -326,8 +374,36 @@ def expand_node(lm, graph: SearchGraph, node_id: int, instance, verifier_fn, con
         any_alive = True
 
     parent.has_been_expanded = True
-    if not any_alive:
+    if not any_alive and not parent.children:
+        # `not parent.children` only matters on a re-expansion (widening):
+        # on a first expansion, no live candidate means no edge was added.
         parent.kind = "exhausted"
+
+
+def _random_reject(child_full_ids, expansion_no: int, cand_idx: int, rate: float) -> bool:
+    h = hashlib.sha256(f"{expansion_no}|{cand_idx}|".encode())
+    h.update(child_full_ids.detach().cpu().numpy().astype("int64").tobytes())
+    return int.from_bytes(h.digest()[:8], "big") / float(1 << 64) < rate
+
+
+def _has_frontier(graph: SearchGraph) -> bool:
+    """Whether any node could still be expanded for the first time."""
+    return any(n.kind in ("root", "step") and not n.has_been_expanded for n in graph.nodes.values())
+
+
+def _is_solved_now(graph: SearchGraph) -> bool:
+    return any(n.kind == "answer" and n.is_terminal_correct for n in graph.nodes.values())
+
+
+def _widen(lm, graph: SearchGraph, node_id: int, instance, verifier_fn, config: SearchConfig) -> None:
+    """Re-sample at an already-expanded node. An exhausted node gets its
+    kind back first, so the expansion can mark it exhausted again (or not)."""
+    node = graph.nodes[node_id]
+    if node.kind == "exhausted":
+        node.kind = "root" if node_id == graph.root_id else "step"
+    node.no_admissible_children = False
+    expand_node(lm, graph, node_id, instance, verifier_fn, config)
+    graph.widenings += 1
 
 
 def backup(graph: SearchGraph, path: list[int], value: float) -> None:
@@ -345,14 +421,31 @@ def run_search(lm, prompt_ids: torch.Tensor, prompt_len: int, instance, verifier
     graph = create_root(prompt_ids, prompt_len)
     expansions_used = 0
     iterations = 0
-    max_iterations = 10 * budget
+    # The old loop gave up at 10 x budget iterations, even with budget left
+    # and a reachable frontier PUCT kept declining to visit (selection can
+    # prefer known-wrong terminals under an inflated prior). With widening on,
+    # a run is IDENTICAL to the old code up to that point; past it, every
+    # terminal selection widens, so every iteration spends budget and the
+    # loop is bounded by 20 x budget.
+    old_cap = 10 * budget
+    max_iterations = 20 * budget if config.widen_on_starvation else old_cap
     while expansions_used < budget and iterations < max_iterations:
         iterations += 1
+        if config.stop_on_solve and _is_solved_now(graph):
+            break
         path = select_leaf(graph, config)
         leaf = graph.nodes[path[-1]]
         if leaf.kind in ("answer", "exhausted"):
             value = 1.0 if leaf.is_terminal_correct else 0.0
             backup(graph, path, value)
+            if config.widen_on_starvation and (iterations > old_cap or not _has_frontier(graph)):
+                # Never a node at max_depth: every candidate it draws is
+                # discarded for depth, so the K samples would be wasted.
+                target = next(nid for nid in reversed(path)
+                              if graph.nodes[nid].kind != "answer" and graph.nodes[nid].depth < config.max_depth)
+                _widen(lm, graph, target, instance, verifier_fn, config)
+                expansions_used += 1
+                graph.expansions_used = expansions_used
             continue
         if leaf.has_been_expanded:
             # `select_leaf` returned an already-expanded, non-terminal node,
@@ -368,6 +461,11 @@ def run_search(lm, prompt_ids: torch.Tensor, prompt_len: int, instance, verifier
             leaf.no_admissible_children = True
             backup(graph, path, leaf.guide_value if leaf.node_id != graph.root_id else 0.5)
             if leaf.node_id == graph.root_id:
+                if config.widen_on_starvation:
+                    _widen(lm, graph, leaf.node_id, instance, verifier_fn, config)
+                    expansions_used += 1
+                    graph.expansions_used = expansions_used
+                    continue
                 break  # nothing anywhere is admissible; the search is done
             continue
         expand_node(lm, graph, leaf.node_id, instance, verifier_fn, config)

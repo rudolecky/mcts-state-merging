@@ -3,13 +3,19 @@ full BFS table -- pure search logic, no GPU/network dependency, mirrors
 test_classical_mcts_puzzle.py's suite.
 """
 
+import functools
 import random
+
+import pytest
 
 from mcts_phase0.classical_mcts_rubiks import (
     ClassicalMCTSConfig,
     MCTSEdge,
+    MCTSGraph,
     MCTSNode,
     _make_node,
+    approx_match,
+    relation_value,
     _misplaced_corners_heuristic,
     _ucb1_score,
     _value_from_h,
@@ -333,3 +339,253 @@ def test_reject_duplicates_solves_a_one_move_scramble_where_merging_is_catastrop
         if is_solved(graph):
             solved_count += 1
     assert solved_count >= trials * 0.7
+
+
+# ---------- approximate equivalence relation (key_tau) ----------
+
+class _TotalDistances(dict):
+    """Exact distances for the shallow region, and a finite stand-in beyond.
+
+    The real experiments pass the complete 3.67M-state table. A unit test
+    cannot afford to build that, and a truncated dict raises KeyError
+    mid-run once the search leaves it -- which it does, because the filter
+    arm goes deeper than the others. Production keeps the strict dict (a
+    genuine gap should be loud); these tests supply a total mapping so they
+    exercise the relation rather than the table's edge."""
+
+    def __init__(self, exact, beyond):
+        super().__init__(exact)
+        self._beyond = beyond
+
+    def __missing__(self, key):
+        return self._beyond
+
+
+@functools.lru_cache(maxsize=1)
+def _tiny_distances():
+    """Cached: the BFS build takes ~6.5s and every test below needs it."""
+    exact = _bfs_distances_up_to_depth(8)
+    return _TotalDistances(exact, beyond=9)
+
+
+def test_key_tau_none_is_the_exact_relation():
+    """The default must remain exact state identity: no depth index built,
+    no matches counted."""
+    distances = _tiny_distances()
+    scrambled = rc.apply_move(rc.SOLVED, rc.ALL_MOVES[0])
+    graph = run_search(scrambled, ClassicalMCTSConfig(merge_enabled=True), 30, 5,
+                       random.Random(0), distances=distances)
+    assert graph.depth_index == {}
+    assert graph.total_matches == 0 and graph.false_matches == 0
+
+
+def test_approx_match_is_nearest_within_tau_at_the_same_depth():
+    """Mirrors search.py.find_merge_target: strict <, nearest wins, and the
+    depth bucket is never crossed."""
+    graph = MCTSGraph(nodes={}, root_key=())
+    for key in ("s_far", "s_near", "s_mid", "other_depth"):
+        graph.nodes[key] = MCTSNode(state=key)  # the index holds node keys now
+    graph.depth_index = {1: [("s_far", 10), ("s_near", 4), ("s_mid", 6)],
+                         2: [("other_depth", 5)]}
+    # Nearest must win, not first-within-tau. At value 6 with tau 3 the first
+    # candidate inside tau is s_near (delta 2) while the nearest is s_mid
+    # (delta 0) -- the one assertion that separates the two rules.
+    assert approx_match(graph, 1, 6, tau=3.0) == "s_mid"
+    assert approx_match(graph, 1, 5, tau=1.5) == "s_near"   # tie on delta -> first seen
+    assert approx_match(graph, 1, 6, tau=0.5) == "s_mid"    # exact hit
+    assert approx_match(graph, 1, 8, tau=1.0) is None       # nothing within tau
+    assert approx_match(graph, 3, 5, tau=99) is None        # empty bucket, no cross-depth match
+    assert approx_match(graph, 1, 10, tau=0.0) is None      # strict <, so tau=0 never matches
+
+
+def test_approximate_relation_produces_measurable_false_matches():
+    """The reason to run an approximate relation on a domain that does not
+    need one: ground truth makes the false-merge rate a measurement."""
+    distances = _tiny_distances()
+    scrambled = rc.apply_move(rc.SOLVED, rc.ALL_MOVES[0])
+    graph = run_search(scrambled, ClassicalMCTSConfig(merge_enabled=True, key_tau=2.0),
+                       40, 5, random.Random(0), distances=distances)
+    assert graph.total_matches > 0
+    assert graph.false_matches > 0  # a 1-D value cannot separate cube states
+    assert graph.false_matches <= graph.total_matches
+
+
+def test_approximate_filter_still_never_pools():
+    """The structural guarantee has to survive the relation being wrong:
+    with an approximate key the filter must still leave a tree."""
+    distances = _tiny_distances()
+    scrambled = rc.apply_move(rc.SOLVED, rc.ALL_MOVES[0])
+    graph = run_search(scrambled,
+                       ClassicalMCTSConfig(merge_enabled=False, reject_duplicates=True, key_tau=2.0),
+                       40, 5, random.Random(0), distances=distances)
+    assert graph.rejected > 0
+    assert graph.total_matches > 0, "the approximate relation never fired -- test is vacuous"
+    assert graph.false_matches > 0, "no false matches -- relation is behaving as an exact one"
+    in_degree = {}
+    for node in graph.nodes.values():
+        for edge in node.children.values():
+            in_degree[edge.child_key] = in_degree.get(edge.child_key, 0) + 1
+    assert all(d == 1 for d in in_degree.values())
+    assert all(n.parent_count <= 1 for n in graph.nodes.values())
+
+
+def test_approximate_merge_pools_into_a_genuinely_different_state():
+    """The failure mode being modelled: under an approximate relation the
+    merge target is usually NOT the state that was just generated, so a
+    node ends up holding statistics from paths that never reached it."""
+    distances = _tiny_distances()
+    scrambled = rc.apply_move(rc.SOLVED, rc.ALL_MOVES[0])
+    graph = run_search(scrambled, ClassicalMCTSConfig(merge_enabled=True, key_tau=2.0),
+                       40, 5, random.Random(0), distances=distances)
+    # Assert what the name claims: some edge leads to a node holding a
+    # DIFFERENT state than the move actually produced. Zero by construction
+    # under an exact relation, so this cannot pass vacuously.
+    wrong_target = 0
+    for node in graph.nodes.values():
+        for move, edge in node.children.items():
+            produced = rc.apply_move(node.state, rc.ALL_MOVES[move])
+            if produced != graph.nodes[edge.child_key].state:
+                wrong_target += 1
+    assert wrong_target > 0, "every edge landed on the state its move produced -- relation was exact"
+    assert graph.false_matches > 0
+
+
+def test_approx_match_skips_exhausted_candidates():
+    """`search.py` skips dead candidates for a stated reason: matching one
+    leaves a state already proven to go nowhere as the sole representative
+    of its class, which the filter arm then destroys candidates in favour
+    of."""
+    graph = MCTSGraph(nodes={}, root_key=())
+    for key in ("dead", "live"):
+        graph.nodes[key] = MCTSNode(state=key)
+    graph.depth_index = {1: [("dead", 5.0), ("live", 5.4)]}
+    assert approx_match(graph, 1, 5.0, tau=1.0) == "dead"  # nearest while alive
+    graph.nodes["dead"].exhausted = True
+    assert approx_match(graph, 1, 5.0, tau=1.0) == "live"  # skipped once dead
+
+
+def test_key_tau_refuses_the_cap_knobs_it_bypasses():
+    import pytest
+    for caps in ({"merge_parent_cap": 1}, {"merge_visit_cap": 2}):
+        with pytest.raises(ValueError):
+            ClassicalMCTSConfig(merge_enabled=True, key_tau=2.0, **caps)
+
+
+def test_the_goal_is_spared_by_default():
+    """Matching `search.py`'s reject_answer_nodes=False. Without it a
+    measured collapse is the relation eating the answer, not the search."""
+    distances = _tiny_distances()
+    scrambled = rc.apply_move(rc.SOLVED, rc.ALL_MOVES[0])
+    for kwargs in ({"merge_enabled": True}, {"merge_enabled": False, "reject_duplicates": True}):
+        graph = run_search(scrambled,
+                           ClassicalMCTSConfig(key_tau=4.0, key_noise=1.0, **kwargs),
+                           60, 5, random.Random(0), distances=distances)
+        states = [n.state for n in graph.nodes.values()]
+        assert rc.SOLVED in states, f"goal was swallowed by the relation ({kwargs})"
+
+
+def test_relation_value_is_stable_across_processes():
+    """`hash()` is randomized per process; this project already lost a set of
+    results to exactly that."""
+    import subprocess
+    import sys
+
+    distances = _tiny_distances()
+    state = rc.apply_move(rc.SOLVED, rc.ALL_MOVES[3])
+    local = relation_value(state, distances, noise=1.0)
+    code = (
+        "from mcts_phase0.classical_mcts_rubiks import relation_value;"
+        "from mcts_phase0.datasets import rubiks_cube_engine as rc;"
+        "s = rc.apply_move(rc.SOLVED, rc.ALL_MOVES[3]);"
+        "print(repr(relation_value(s, {s: 1}, noise=1.0)))"
+    )
+    for seed in ("1", "2"):
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                             env={"PYTHONHASHSEED": seed, "PATH": "/usr/bin:/bin"})
+        assert out.returncode == 0, out.stderr
+        assert abs(float(out.stdout) - (1.0 + (local - distances[state]))) < 1e-12
+
+
+def test_key_noise_actually_perturbs_the_relation_value():
+    """Confound #1 of the discarded first experiment: with integer oracle
+    distances every gap inside a depth bucket is even, so tau collapses to a
+    three-position dial whose first band is *transitive* -- exact identity on
+    a coarsened space, not an approximate relation. `key_noise` is what makes
+    the value continuous. Nothing else in this suite fails if the noise term
+    is dropped from `relation_value`, so this is that test."""
+    distances = _tiny_distances()
+    states = [rc.SOLVED] + [rc.apply_move(rc.SOLVED, m) for m in rc.ALL_MOVES[:6]]
+
+    for state in states:
+        assert relation_value(state, distances, noise=0.0) == float(distances[state])
+
+    offsets = [relation_value(s, distances, noise=1.0) - distances[s] for s in states]
+    assert all(abs(o) <= 1.0 for o in offsets), "noise must stay inside +/- key_noise"
+    assert any(o != 0.0 for o in offsets), "noise term is not being applied at all"
+    # The point of the noise is to break the parity, so the perturbed values
+    # must not all land back on the integer grid the confound came from.
+    assert any(abs(o) > 1e-9 and abs(o - round(o)) > 1e-9 for o in offsets)
+    # Distinct states must get distinct offsets, or the relation is still a
+    # coarsening rather than a noisy estimate.
+    assert len(set(offsets)) > 1, "every state got the same offset"
+    # Scaling key_noise must scale the perturbation: pins it as a magnitude,
+    # not a flag.
+    for state in states:
+        o1 = relation_value(state, distances, noise=1.0) - distances[state]
+        o2 = relation_value(state, distances, noise=4.0) - distances[state]
+        assert abs(o2 - 4.0 * o1) < 1e-12
+
+
+def test_charge_rejections_moves_the_budget_a_rejection_costs():
+    """The whole comparative claim for the filter arm rests on this flag: a
+    rejected move never becomes an expansion but does cost a real
+    `apply_move`, so leaving it uncharged hands the arm extra compute. Had no
+    coverage here, on the module whose published result depends on it."""
+    distances = _tiny_distances()
+    scrambled = rc.apply_move(rc.SOLVED, rc.ALL_MOVES[0])
+    budget = 40
+
+    def run(charge):
+        return run_search(scrambled,
+                          ClassicalMCTSConfig(merge_enabled=False, reject_duplicates=True,
+                                              charge_rejections=charge),
+                          budget, 5, random.Random(0), distances=distances)
+
+    free, charged = run(False), run(True)
+    assert free.rejected > 0, "fixture produced no rejections; it cannot test the flag"
+    # Charging spends budget on rejections, so strictly less of it reaches
+    # expansions -- the arm must end up smaller.
+    assert len(charged.nodes) < len(free.nodes)
+    # And the charged arm's real work stays within budget, modulo the known
+    # overshoot of at most one expand() call's worth of rejections.
+    assert len(charged.nodes) - 1 + charged.rejected <= budget + len(rc.ALL_MOVES)
+
+
+def test_expand_noise_zero_proposes_a_distance_reducing_move_first():
+    """expand_noise=0.0 is a perfect proposal policy: the first child
+    expanded from any non-goal state must be one step closer to solved.
+    The default (None) must stay uniformly random -- covered by the no-op
+    equivalence check -- so this pins only the new branch."""
+    distances = _tiny_distances()
+    start = rc.apply_move(rc.apply_move(rc.SOLVED, rc.ALL_MOVES[0]), rc.ALL_MOVES[4])
+    d0 = distances[start]
+    assert d0 == 2, "fixture must be two moves from solved"
+    for seed in range(5):
+        graph = create_root(start, False, False)
+        cfg = ClassicalMCTSConfig(merge_enabled=False, value_source="oracle", expand_noise=0.0)
+        child_key = expand(graph, graph.root_key, (), cfg, random.Random(seed), distances)
+        assert distances[graph.nodes[child_key].state] == d0 - 1
+
+
+def test_expand_noise_requires_distances():
+    with pytest.raises(ValueError, match="expand_noise"):
+        run_search(rc.SOLVED, ClassicalMCTSConfig(merge_enabled=False, expand_noise=0.5),
+                   5, 3, random.Random(0), distances=None)
+
+
+def test_key_tau_is_refused_on_a_tree_arm():
+    """Without merge or reject, expand's key_tau branch pooled into matches,
+    so a 'tree' arm silently became a DAG (found by audit: 10 nodes and 91
+    matches where a real tree had 96 nodes)."""
+    with pytest.raises(ValueError, match="key_tau needs"):
+        ClassicalMCTSConfig(merge_enabled=False, key_tau=1.0)

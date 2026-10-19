@@ -38,7 +38,7 @@ def _stats(rows, key_a, key_b):
     return diffs.mean(), ci, p
 
 
-def run_tier(target_distance, budgets, n_puzzles, repeats, distances, seed=0, reject=False):
+def run_tier(target_distance, budgets, n_puzzles, repeats, distances, seed=0, reject=False, charge=False):
     """`reject` adds a third comparison (stage3): merge vs. the
     reject-duplicates admission filter.
 
@@ -76,7 +76,7 @@ def run_tier(target_distance, budgets, n_puzzles, repeats, distances, seed=0, re
 
                 if reject:
                     rng4 = random.Random(i * 100003 + r)
-                    cfg_reject = GUCTUniformConfig(merge_enabled=False, reject_duplicates=True)
+                    cfg_reject = GUCTUniformConfig(merge_enabled=False, reject_duplicates=True, charge_rejections=charge)
                     g_reject = run_search(inst.start_state, cfg_reject, budget, rng4, distances)
                     reject_solved += int(is_solved(g_reject))
             rows1.append({"id": inst.id, "tree": tree_solved / repeats, "random": random_solved / repeats})
@@ -114,6 +114,8 @@ def main():
                     help="also run the reject-duplicates arm (stage3) and compare it against "
                          "merging. Falsification test for the Blocksworld crossing result -- the "
                          "explanation there predicts a null here.")
+    ap.add_argument("--charge-rejections", action="store_true",
+                    help="charge each rejected move against the budget (a rejection still costs a real state generation). Required for any filter-vs-merge comparison at matched compute; off by default only so previously recorded uncharged runs stay reproducible.")
     ap.add_argument("--output", default="results/guct_uniform_experiment_rubiks.json")
     args = ap.parse_args()
 
@@ -124,13 +126,16 @@ def main():
     all_results = []
     print("=== RUBIK'S CUBE GUCT-UNIFORM, td=6 ===")
     all_results.append(run_tier(target_distance=6, budgets=[40, 60, 70, 90],
-                                 n_puzzles=args.n_puzzles, repeats=args.repeats, distances=distances, reject=args.reject))
+                                 n_puzzles=args.n_puzzles, repeats=args.repeats, distances=distances, reject=args.reject,
+                                 charge=args.charge_rejections))
     print("=== RUBIK'S CUBE GUCT-UNIFORM, td=8 ===")
     all_results.append(run_tier(target_distance=8, budgets=[50, 70, 80, 100],
-                                 n_puzzles=args.n_puzzles, repeats=args.repeats, distances=distances, reject=args.reject))
+                                 n_puzzles=args.n_puzzles, repeats=args.repeats, distances=distances, reject=args.reject,
+                                 charge=args.charge_rejections))
     print("=== RUBIK'S CUBE GUCT-UNIFORM, td=10 ===")
     all_results.append(run_tier(target_distance=10, budgets=[90, 110, 130, 170],
-                                 n_puzzles=args.n_puzzles, repeats=args.repeats, distances=distances, reject=args.reject))
+                                 n_puzzles=args.n_puzzles, repeats=args.repeats, distances=distances, reject=args.reject,
+                                 charge=args.charge_rejections))
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

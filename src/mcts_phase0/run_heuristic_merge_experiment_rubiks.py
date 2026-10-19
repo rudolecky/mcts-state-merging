@@ -43,7 +43,8 @@ def _stats(rows, key_a, key_b):
     return diffs.mean(), ci, p
 
 
-def run_tier(target_distance, c, budgets, n_puzzles, repeats, rollout_depth, distances, seed=0, reject=False):
+def run_tier(target_distance, c, budgets, n_puzzles, repeats, rollout_depth, distances, seed=0, reject=False,
+             charge=False):
     """`reject` adds a third comparison (stage3): tree vs. the
     reject-duplicates admission filter, which keeps path-based node keys --
     so no statistics are ever pooled and the backup rule is untouched --
@@ -79,7 +80,7 @@ def run_tier(target_distance, c, budgets, n_puzzles, repeats, rollout_depth, dis
                 if reject:
                     rng4 = random.Random(i * 100003 + r)
                     cfg_reject = ClassicalMCTSConfig(merge_enabled=False, reject_duplicates=True,
-                                                     value_source="oracle", c=c)
+                                                     value_source="oracle", c=c, charge_rejections=charge)
                     g_reject = run_search(inst.start_state, cfg_reject, budget, rollout_depth, rng4, distances=distances)
                     reject_solved += int(is_solved(g_reject))
             rows1.append({"id": inst.id, "tree": oracle_solved / repeats, "random": random_solved / repeats})
@@ -117,6 +118,8 @@ def main():
                     help="also run the reject-duplicates arm (stage3): merging's "
                          "distinctness without its statistic pooling. Off by default so the "
                          "published two-stage run is unchanged.")
+    ap.add_argument("--charge-rejections", action="store_true",
+                    help="charge each rejected move against the budget (a rejection still costs a real state generation). Required for any filter-vs-merge comparison at matched compute; off by default only so previously recorded uncharged runs stay reproducible.")
     ap.add_argument("--output", default="results/heuristic_merge_experiment_rubiks.json")
     args = ap.parse_args()
 
@@ -128,15 +131,18 @@ def main():
     print("=== RUBIK'S CUBE, td=6, c=0.02 ===")
     all_results.append(run_tier(target_distance=6, c=0.02, budgets=[50, 100, 200, 300],
                                  n_puzzles=args.n_puzzles, repeats=args.repeats,
-                                 rollout_depth=args.rollout_depth, distances=distances, reject=args.reject))
+                                 rollout_depth=args.rollout_depth, distances=distances, reject=args.reject,
+                                 charge=args.charge_rejections))
     print("=== RUBIK'S CUBE, td=8, c=0.02 ===")
     all_results.append(run_tier(target_distance=8, c=0.02, budgets=[100, 200, 400, 600],
                                  n_puzzles=args.n_puzzles, repeats=args.repeats,
-                                 rollout_depth=args.rollout_depth, distances=distances, reject=args.reject))
+                                 rollout_depth=args.rollout_depth, distances=distances, reject=args.reject,
+                                 charge=args.charge_rejections))
     print("=== RUBIK'S CUBE, td=10, c=0.02 ===")
     all_results.append(run_tier(target_distance=10, c=0.02, budgets=[200, 400, 800, 1200],
                                  n_puzzles=args.n_puzzles, repeats=args.repeats,
-                                 rollout_depth=args.rollout_depth, distances=distances, reject=args.reject))
+                                 rollout_depth=args.rollout_depth, distances=distances, reject=args.reject,
+                                 charge=args.charge_rejections))
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)

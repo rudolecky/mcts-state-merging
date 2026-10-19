@@ -702,3 +702,269 @@ def test_uses_tau_matches_which_arms_actually_depend_on_tau(monkeypatch):
             f"arm {arm!r}: _uses_tau says {_uses_tau(arm)} but running at tau=0.0 vs 0.5 "
             f"{'changed' if changed else 'did not change'} the search. The checkpoint's shard "
             "naming depends on these agreeing.")
+
+
+# ---------- budget-leak fix, stop-on-solve, random-rejection control ----------
+
+def _growing_fixture(monkeypatch, answer_every: int = 0, distinct_values: bool = False):
+    """Every call yields K distinct new steps under the given prefix, so a
+    search never runs out of unexpanded nodes before max_depth. With
+    answer_every=n, every n-th candidate is an answer instead."""
+    import itertools
+    lm = _FakeLM(num_hidden_layers=4)
+    counter = itertools.count()
+
+    def gen(lm_, prefix, K, mx, temp):
+        out = []
+        for _ in range(K):
+            i = next(counter)
+            # Leading newline: a node's prefix ends at its step's last character,
+            # not after the line break, so without it the new step joins that line.
+            text = f"\nAnswer: {i}\n" if answer_every and i % answer_every == answer_every - 1 else f"\nStep 1: {i}\n"
+            out.append(torch.cat([prefix, torch.tensor(_text_to_ids(text), dtype=torch.long)]))
+        return out
+
+    def value_of(ids):
+        if not distinct_values:
+            return 0.42  # every candidate matches: the deduplicating arms collapse to one chain
+        import hashlib
+        digest = hashlib.sha256(bytes(ids.tolist())).digest()
+        u = int.from_bytes(digest[:8], "big") / float(1 << 64)
+        # distinct_values="grid": 8 levels, so a tau of 0.05 matches some
+        # candidates and not others -- relations fire without collapsing.
+        return round(u * 7) / 7 if distinct_values == "grid" else u
+
+    monkeypatch.setattr(search_mod, "generate_traces", gen)
+    monkeypatch.setattr(search_mod, "hidden_states_for_sequence",
+                        lambda lm_, ids: _fake_hidden_states_constant(value_of(ids), lm_.num_hidden_layers,
+                                                                      seq_len=len(ids) + 1))
+    return lm
+
+
+def _prompt():
+    ids = torch.tensor(_text_to_ids("Q\n"), dtype=torch.long)
+    return ids, len(ids)
+
+
+def _graph_signature(graph):
+    return [(n.node_id, n.depth, n.kind, n.n_visits, round(n.w_value, 9), n.has_been_expanded,
+             tuple((e.child_id, round(e.prior, 9), e.n_edge) for e in n.children))
+            for n in sorted(graph.nodes.values(), key=lambda n: n.node_id)]
+
+
+def _cfg(**kw):
+    kw.setdefault("tau", 0.05)
+    return SearchConfig(K=3, max_new_tokens_step=20, temperature=0.8, c_puct=1.0,
+                        projection=_trivial_projection(), **kw)
+
+
+_ALL_ARMS = ({"merge_enabled": False}, {"merge_enabled": True},
+             {"merge_enabled": False, "reject_duplicates": True})
+
+
+def test_widening_is_a_strict_no_op_while_a_frontier_exists(monkeypatch):
+    """The fix may only change searches that would otherwise starve or hit
+    the old iteration cap. With relations genuinely firing (merges and
+    rejections both > 0) and terminals in the mix, on and off must give
+    identical graphs in every arm."""
+    arms = ({"merge_enabled": False}, {"merge_enabled": True},
+            {"merge_enabled": False, "reject_duplicates": True},
+            {"merge_enabled": False, "reject_duplicates": True, "reject_answer_nodes": True},
+            {"merge_enabled": False, "random_reject_rate": 0.3})
+    for arm in arms:
+        sigs, acted = [], []
+        for widen in (False, True):
+            lm = _growing_fixture(monkeypatch, answer_every=4, distinct_values="grid")
+            ids, plen = _prompt()
+            g = search_mod.run_search(lm, ids, plen, None, _dummy_verifier,
+                                      _cfg(widen_on_starvation=widen, **arm), budget=10)
+            sigs.append(_graph_signature(g))
+            acted.append(g.merge_hits + g.rejected)
+            assert g.widenings == 0, f"arm {arm} starved; the fixture cannot test the no-op"
+            monkeypatch.undo()
+        assert sigs[0] == sigs[1], f"widening changed a non-starving search in arm {arm}"
+        if arm != {"merge_enabled": False}:
+            assert acted[0] > 0, f"arm {arm}: the relation never fired, so this tested the baseline"
+
+
+def test_widening_spends_the_budget_a_starved_search_leaves(monkeypatch):
+    """_reject_fixture's candidates die at depth 1, so every arm runs out of
+    expandable nodes after a few expansions. Without the fix the budget goes
+    unspent; with it, all of it is spent -- and only ever on an empty frontier."""
+    for arm in _ALL_ARMS:
+        spent = {}
+        for widen in (False, True):
+            lm = _reject_fixture(monkeypatch)
+            calls = []
+            inner = search_mod._widen
+
+            def checked(lm_, graph, node_id, instance, verifier_fn, config):
+                calls.append(search_mod._has_frontier(graph))
+                return inner(lm_, graph, node_id, instance, verifier_fn, config)
+
+            monkeypatch.setattr(search_mod, "_widen", checked)
+            draws = []
+            inner_gen = search_mod.generate_traces
+
+            def counting_gen(*a, **k):
+                draws.append(1)
+                return inner_gen(*a, **k)
+
+            monkeypatch.setattr(search_mod, "generate_traces", counting_gen)
+            g = search_mod.run_search(lm, torch.tensor(_text_to_ids("")), 0, None, _dummy_verifier,
+                                      _cfg(widen_on_starvation=widen, **arm), budget=12)
+            spent[widen] = g.expansions_used
+            assert not any(calls), "widened while an unexpanded node still existed"
+            assert g.widenings == len(calls)
+            # Every charged expansion must be a real LLM draw, not a counter bump.
+            assert len(draws) == g.expansions_used
+            monkeypatch.undo()
+        assert spent[False] < 12, f"fixture did not starve in arm {arm}; it cannot test the fix"
+        assert spent[True] == 12, f"arm {arm} still leaked budget with the fix on"
+
+
+def test_stop_on_solve_stops_early_and_cannot_change_solved(monkeypatch):
+    def always_right(instance, step_bodies, answer_body):
+        return True, {}
+
+    results = {}
+    for stop in (False, True):
+        lm = _growing_fixture(monkeypatch, answer_every=3)
+        ids, plen = _prompt()
+        g = search_mod.run_search(lm, ids, plen, None, always_right,
+                                  _cfg(merge_enabled=False, stop_on_solve=stop), budget=10)
+        results[stop] = (search_mod.is_solved(g), g.expansions_used)
+        monkeypatch.undo()
+    assert results[False][0] is True and results[True][0] is True
+    assert results[True][1] < results[False][1]
+
+
+def test_random_reject_rate_one_drops_every_step_but_spares_answers(monkeypatch):
+    lm = _growing_fixture(monkeypatch, answer_every=3)
+    ids, plen = _prompt()
+    graph = create_root(ids, plen)
+    expand_node(lm, graph, graph.root_id, None, _dummy_verifier, _cfg(merge_enabled=False, random_reject_rate=1.0))
+    kinds = [n.kind for n in graph.nodes.values() if n.node_id != graph.root_id]
+    assert kinds == ["answer"]  # 2 steps dropped, the answer kept
+    assert graph.rejected == 2
+
+
+def test_random_reject_decides_identical_candidates_independently(monkeypatch):
+    """Two identical draws in one batch must not share a fate -- otherwise the
+    control would itself deduplicate (keep all copies or drop all copies)."""
+    lm = _reject_fixture(monkeypatch)  # K identical step candidates every time
+    mixed = 0
+    for expansion_no in range(40):
+        graph = create_root(torch.tensor(_text_to_ids("")), prompt_len=0)
+        graph.expansions_used = expansion_no
+        expand_node(lm, graph, graph.root_id, None, _dummy_verifier,
+                    _cfg(merge_enabled=False, random_reject_rate=0.5))
+        kept = len(graph.nodes) - 1
+        mixed += 0 < kept < 3
+    assert mixed > 10
+
+
+def test_random_reject_hits_its_rate_and_is_deterministic(monkeypatch):
+    runs = []
+    for _ in range(2):
+        lm = _growing_fixture(monkeypatch)
+        ids, plen = _prompt()
+        g = search_mod.run_search(lm, ids, plen, None, _dummy_verifier,
+                                  _cfg(merge_enabled=False, random_reject_rate=0.5, widen_on_starvation=True),
+                                  budget=60)
+        created = sum(1 for n in g.nodes.values() if n.kind in ("step", "exhausted"))
+        runs.append((g.rejected, created, _graph_signature(g)))
+        monkeypatch.undo()
+    rejected, created, _ = runs[0]
+    assert 0.35 < rejected / (rejected + created) < 0.65
+    assert runs[0] == runs[1]
+
+
+def test_random_reject_refuses_to_stack_on_a_relation():
+    with pytest.raises(ValueError, match="control on the plain tree"):
+        _cfg(merge_enabled=False, reject_duplicates=True, random_reject_rate=0.5)
+    with pytest.raises(ValueError, match="control on the plain tree"):
+        _cfg(merge_enabled=True, random_reject_rate=0.5)
+    with pytest.raises(ValueError, match="in \\[0, 1\\]"):
+        _cfg(merge_enabled=False, random_reject_rate=1.5)
+
+
+def test_widening_never_marks_a_node_with_children_exhausted(monkeypatch):
+    """A re-expansion whose fresh candidates are all dead must not mark the
+    node exhausted -- it already has children, and `select_leaf` treats an
+    exhausted node as a terminal, which would cut its whole subtree off."""
+    lm = _growing_fixture(monkeypatch, distinct_values=True)
+    ids, plen = _prompt()
+    graph = create_root(ids, plen)
+    cfg = _cfg(merge_enabled=False)
+    expand_node(lm, graph, graph.root_id, None, _dummy_verifier, cfg)
+    assert graph.nodes[graph.root_id].children
+    monkeypatch.setattr(search_mod, "generate_traces",
+                        lambda lm_, prefix, K, mx, temp: [prefix.clone() for _ in range(K)])  # no new boundary: dead
+    search_mod._widen(lm, graph, graph.root_id, None, _dummy_verifier, cfg)
+    assert graph.nodes[graph.root_id].kind == "root"
+
+
+def test_widening_reexpands_the_root_instead_of_ending_the_search(monkeypatch):
+    """At rate 1.0 every step candidate at the root is dropped, leaving it
+    expanded with no children. Without widening the search ends after one
+    expansion; with it, the root is re-sampled and the budget is spent."""
+    spent = {}
+    for widen in (False, True):
+        lm = _growing_fixture(monkeypatch)
+        ids, plen = _prompt()
+        g = search_mod.run_search(lm, ids, plen, None, _dummy_verifier,
+                                  _cfg(merge_enabled=False, random_reject_rate=1.0, widen_on_starvation=widen),
+                                  budget=5)
+        spent[widen] = (g.expansions_used, g.widenings)
+        monkeypatch.undo()
+    assert spent[False] == (1, 0)
+    assert spent[True] == (5, 4)
+
+
+def test_widening_never_targets_a_node_at_max_depth(monkeypatch):
+    """A max_depth node's candidates are all discarded for depth, so widening
+    it would waste K samples every time. The target falls back to its parent."""
+    lm = _growing_fixture(monkeypatch)
+    ids, plen = _prompt()
+    depths = []
+    inner = search_mod._widen
+
+    def recording(lm_, graph, node_id, instance, verifier_fn, config):
+        depths.append(graph.nodes[node_id].depth)
+        return inner(lm_, graph, node_id, instance, verifier_fn, config)
+
+    monkeypatch.setattr(search_mod, "_widen", recording)
+    g = search_mod.run_search(lm, ids, plen, None, _dummy_verifier,
+                              _cfg(merge_enabled=False, widen_on_starvation=True, max_depth=1), budget=12)
+    assert depths, "fixture never starved"
+    assert all(d < 1 for d in depths), f"widened at max_depth: {depths}"
+    assert g.expansions_used == 12
+
+
+def test_widening_spends_budget_past_the_old_iteration_cap(monkeypatch):
+    """A run can also leak with a frontier present: PUCT keeps choosing known
+    terminals until the old 10 x budget cap ends it. Forced here by pretending
+    a frontier always exists on a fixture that in fact starves."""
+    spent = {}
+    for widen in (False, True):
+        lm = _reject_fixture(monkeypatch)
+        monkeypatch.setattr(search_mod, "_has_frontier", lambda graph: True)
+        g = search_mod.run_search(lm, torch.tensor(_text_to_ids("")), 0, None, _dummy_verifier,
+                                  _cfg(merge_enabled=False, widen_on_starvation=widen), budget=8)
+        spent[widen] = g.expansions_used
+        monkeypatch.undo()
+    assert spent[False] < 8
+    assert spent[True] == 8
+
+
+def test_stop_on_solve_is_inert_on_an_unsolved_search(monkeypatch):
+    sigs = []
+    for stop in (False, True):
+        lm = _growing_fixture(monkeypatch, answer_every=3)
+        ids, plen = _prompt()
+        g = search_mod.run_search(lm, ids, plen, None, _dummy_verifier,
+                                  _cfg(merge_enabled=False, stop_on_solve=stop), budget=8)
+        sigs.append(_graph_signature(g))
+        monkeypatch.undo()
+    assert sigs[0] == sigs[1]
